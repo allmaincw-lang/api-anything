@@ -36,7 +36,7 @@ import {
 } from "./login.js";
 import { type Outline, outline } from "./outline.js";
 import { plan, uploadName } from "./publish.js";
-import { pull, search } from "./registry.js";
+import { pull, reportInterface, search } from "./registry.js";
 import { settle } from "./report.js";
 import { loadSession } from "./session.js";
 import { AGENTS, type Agent, askYesNo, setup, summary } from "./setup.js";
@@ -199,7 +199,14 @@ const HELP: Record<string, string> = {
   machine, best match first, each op with its params and its status in the registry. Words match a
   site's name, its description and what its operations do and return ("book ratings"); a domain or a
   URL matches the sites whose operations use it (news.ycombinator.com). Each match says whether it is
-  installed; pull one that is not. API_ANYTHING_REGISTRY overrides the registry's URL.`,
+  installed; pull one that is not. A match may list the site's own agent interfaces (an MCP server, an
+  OpenAPI document); a domain search finds a site that has only those. API_ANYTHING_REGISTRY overrides
+  the registry's URL.`,
+  interface: `api-anything interface mcp|openapi <url>
+  Tells the registry a site offers its own agent interface: an MCP server or an OpenAPI document, https
+  on the site's own domain. Once installs on enough distinct networks said so, search lists it beside
+  the site's operations, and a domain search finds a site that has only it. Signed with this install's
+  key; nothing else is sent.`,
   pull: `api-anything pull <site>
   Fetches a site someone shared from the registry into ~/.api-anything/registry, so you can call it
   without learning it. Someone else wrote it: it is checked against the shared rules first, and its
@@ -262,6 +269,7 @@ const USAGE = `api-anything ${VERSION}: turn a website into operations an agent 
   api-anything call <site> <op> [k=v ...] [--allow-writes]
   api-anything inspect <captureId> [<requestId>]
   api-anything search <words|domain> | pull <site> | publish <site> [--yes]
+  api-anything interface mcp|openapi <url>
   api-anything check <site> <op> [k=v ...] --expect result|empty|input
   api-anything readback <site> <write-op> <read-op> [k=v ...] [--find field=value]
   api-anything verify [site] | sites | ops <site> | heal <site> <op> | export <site>
@@ -1091,10 +1099,20 @@ async function cmdSearch({ pos }: Parsed): Promise<number> {
     ...(r.matches.length ? { shared: SHARED_NOTE } : {}),
     next: !top
       ? "nobody shared one yet: learn it with api-anything capture and add, then share it with api-anything publish"
-      : top.installed
-        ? `check that ${top.domain} is the site meant, then api-anything ops ${top.site} lists its operations`
-        : `check that ${top.domain} is the site meant (a lookalike name can point elsewhere), then api-anything pull ${top.site} fetches it; read its warnings with the user before the first call`,
+      : !top.operations.length && top.interfaces?.length
+        ? `${top.domain} offers its own agent interface: ${top.interfaces.map((i) => `${i.kind} ${i.url}`).join(", ")}`
+        : top.installed
+          ? `check that ${top.domain} is the site meant, then api-anything ops ${top.site} lists its operations`
+          : `check that ${top.domain} is the site meant (a lookalike name can point elsewhere), then api-anything pull ${top.site} fetches it; read its warnings with the user before the first call`,
   });
+  return 0;
+}
+
+async function cmdInterface({ pos }: Parsed): Promise<number> {
+  const [kind, url] = pos;
+  if ((kind !== "mcp" && kind !== "openapi") || !url)
+    throw new Fail("usage: interface mcp|openapi <url>", "api-anything interface --help");
+  out({ ok: true, ...(await reportInterface(kind, url)) });
   return 0;
 }
 
@@ -1282,6 +1300,7 @@ const COMMANDS: Record<string, { run: (p: Parsed) => number | Promise<number>; f
   heal: { run: cmdHeal, flags: [] },
   export: { run: cmdExport, flags: ["out", "keep-examples", "force"] },
   search: { run: cmdSearch, flags: [] },
+  interface: { run: cmdInterface, flags: [] },
   pull: { run: cmdPull, flags: [] },
   publish: { run: cmdPublish, flags: ["yes"] },
   mcp: { run: cmdMcp, flags: ["allow-writes", "sites", "print-config", "no-learn"] },

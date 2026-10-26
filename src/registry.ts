@@ -13,7 +13,7 @@ import { indexEntry, score, summarize } from "./search.js";
 import { dropUnbound, home, loadSession, readJson, safeName, siteOf, writePrivate } from "./session.js";
 import { type Operation, parseSite, type Site } from "./spec.js";
 import { listSites, loadSite, registryDir, updateSite } from "./store.js";
-import { LIMITS, vetShared } from "./vet.js";
+import { badAddress, LIMITS, vetShared } from "./vet.js";
 
 export { summarize };
 
@@ -320,12 +320,32 @@ const FoundOpSchema = z.object({
     )
     .max(50),
 });
+const InterfaceSchema = z.object({
+  kind: z.enum(["mcp", "openapi"]),
+  url: z
+    .string()
+    .max(2000)
+    .refine((u) => !badAddress(u), "an interface is https on a public host"),
+  confirmations: z.number().int().min(0),
+});
+
 const SearchMatchSchema = z.object({
   name: z.string().regex(/^[a-z0-9][a-z0-9._-]{0,63}$/),
   domain: z.string().regex(/^[a-z0-9.-]{1,253}$/),
   displayName: z.string().max(100).optional(),
   description: text.optional(),
   operations: z.array(FoundOpSchema).max(LIMITS.operations),
+  // a malformed interface is dropped, not the match
+  interfaces: z
+    .array(z.unknown())
+    .max(10)
+    .optional()
+    .transform((list) =>
+      list?.flatMap((x) => {
+        const p = InterfaceSchema.safeParse(x);
+        return p.success ? [p.data] : [];
+      }),
+    ),
 });
 
 /**
@@ -372,6 +392,8 @@ export interface Found {
   /** on this machine already: its own spec, a pulled one or a bundled one */
   installed: boolean;
   operations: FoundOperation[];
+  /** the site's own agent interfaces (an MCP server, an OpenAPI document), as installs reported them */
+  interfaces?: { kind: "mcp" | "openapi"; url: string; confirmations: number }[];
 }
 
 /** This machine's specs; one that does not load is left out, as `sites` reports it. */
@@ -451,6 +473,7 @@ export async function search(
           ...(m.description ? { description: m.description } : {}),
           installed: false,
           operations: m.operations,
+          ...(m.interfaces?.length ? { interfaces: m.interfaces } : {}),
         },
         s: score(
           { ...m, site: m.name, domains: [m.domain], operations: m.operations.map((x) => ({ ...x, op: x.signature })) },
@@ -467,4 +490,21 @@ export async function search(
     .slice(0, limit)
     .map((x) => x.found);
   return { matches, ...(registryError ? { registryError } : {}) };
+}
+
+/**
+ * Tells the registry a site offers its own agent interface at `url` (an MCP server or an OpenAPI document,
+ * https on the site's own domain). Once installs on enough networks said so, search lists it beside the
+ * site's operations, and finds a site that has only it.
+ */
+export async function reportInterface(kind: "mcp" | "openapi", url: string, o: { signal?: AbortSignal } = {}) {
+  const bad = badAddress(url);
+  if (bad) throw new Error(`the interface's url ${bad}`);
+  return registryRequest<{ domain: string; served: boolean }>("/v1/interfaces", {
+    method: "POST",
+    body: { kind, url },
+    signed: true,
+    cap: 64 * 1024,
+    signal: o.signal,
+  });
 }

@@ -1,5 +1,6 @@
 /** The registry Worker: the HTTP surface of src/registry-api.ts, the pages, and the daily archive. */
 import { z } from "zod";
+import { siteOf } from "../../src/domain.js";
 import {
   anonymous,
   type ClaimResult,
@@ -7,12 +8,14 @@ import {
   fingerprintText,
   nameHashText,
   type Report,
+  type SearchMatch,
   type Status,
   type UploadResult,
   type VerifyJob,
 } from "../../src/registry-api.js";
 import { domainOf } from "../../src/search.js";
 import type { Operation } from "../../src/spec.js";
+import { badAddress } from "../../src/vet.js";
 import { networksOf, sha256Hex, signatureHeaders, signer } from "./auth.js";
 import { catalog, confirmed, entryOf, search } from "./catalog.js";
 import { CSP, homePage, sitemap, sitePage } from "./pages.js";
@@ -35,8 +38,10 @@ import {
   getVersion,
   holders,
   incumbentSig,
+  interfacesOf,
   putClaim,
   putReport,
+  reportInterface,
   reseed,
   seedSite,
   setStatus,
@@ -210,9 +215,22 @@ async function searchApi(c: Ctx) {
   if (!q) throw new HttpError(400, "search takes q: words, a domain or a URL");
   const limit = Math.min(Math.max(Number(c.url.searchParams.get("limit")) || 5, 1), 20);
   const sites = await catalog(c.env.DB, c.since, await keyOf(c, false));
-  const matches = search(sites, q, limit);
+  const matches = await withInterfaces(c, search(sites, q, limit));
+  const asked = domainOf(q);
+  // a site with only its own agent interface is found by its domain
+  if (!matches.length && asked) {
+    const own = (await interfacesOf(c.env.DB, [asked], interfaceKeys(c))).get(asked);
+    if (own)
+      matches.push({
+        name: asked.replace(/\./g, "-"),
+        domain: asked,
+        displayName: asked,
+        operations: [],
+        interfaces: own,
+      });
+  }
   // a site agents want and nobody shared: its domain, never the words of a search
-  const domain = matches.length ? undefined : domainOf(q);
+  const domain = matches.length ? undefined : asked;
   if (domain) {
     const { network } = await networksOf(c.request, salt(c));
     await wantDomain(c.env.DB, domain, network, new Date(c.now).toISOString());
@@ -230,7 +248,36 @@ async function demandApi(c: Ctx) {
 async function siteApi(c: Ctx, name: string) {
   const [site] = await catalog(c.env.DB, c.since, await keyOf(c, false), name);
   if (!site) throw new HttpError(404, `no shared site ${name}`);
-  return json(site);
+  const own = (await interfacesOf(c.env.DB, [site.domain], interfaceKeys(c))).get(site.domain);
+  return json(own ? { ...site, interfaces: own } : site);
+}
+
+/** Installs, one per network, that must report an interface before it is served: as many as promote a version. */
+const interfaceKeys = (c: Ctx) => Math.max(c.t.promoteKeys, c.t.promoteNetworks);
+
+async function withInterfaces(c: Ctx, matches: SearchMatch[]): Promise<SearchMatch[]> {
+  const byDomain = await interfacesOf(c.env.DB, [...new Set(matches.map((m) => m.domain))], interfaceKeys(c));
+  return matches.map((m) => (byDomain.get(m.domain) ? { ...m, interfaces: byDomain.get(m.domain) } : m));
+}
+
+const InterfaceSchema = z.object({
+  kind: z.enum(["mcp", "openapi"]),
+  url: z.string().max(2000),
+});
+
+/** An install says a site offers its own agent interface. It must be https on a public host; it is keyed by its registrable domain. */
+async function addInterface(c: Ctx) {
+  const key = await keyOf(c, true);
+  const r = InterfaceSchema.safeParse(parseJson(c.body));
+  if (!r.success) throw new HttpError(400, "the body is { kind: mcp | openapi, url }", issues(r.error));
+  const bad = badAddress(r.data.url);
+  if (bad) throw new HttpError(422, "the interface is refused", [`its url ${bad}`]);
+  const { network, prefix } = await networksOf(c.request, salt(c));
+  await spend(c, "upload", key, prefix, 1);
+  const domain = siteOf(new URL(r.data.url).hostname);
+  await reportInterface(c.env.DB, { ...r.data, domain, key, network }, new Date(c.now).toISOString());
+  const served = (await interfacesOf(c.env.DB, [domain], interfaceKeys(c))).get(domain) ?? [];
+  return json({ domain, served: served.some((i) => i.url === r.data.url) });
 }
 
 async function indexApi(c: Ctx) {
@@ -556,6 +603,7 @@ const ROUTES: [method: string, path: RegExp, handler: Handler, auth?: Auth, maxB
   ["POST", /^\/v1\/versions$/, upload, "signed"],
   ["POST", /^\/v1\/reports$/, reports, "signed"],
   ["POST", /^\/v1\/claims$/, claims, "signed"],
+  ["POST", /^\/v1\/interfaces$/, addInterface, "signed"],
   ["GET", /^\/v1\/claims$/, claims, "signed"],
   ["POST", /^\/v1\/admin\/versions\/([0-9a-f]{64})$/, adminVersion, "admin"],
   ["POST", /^\/v1\/admin\/seed$/, adminSeed, "admin", MAX_SEED],

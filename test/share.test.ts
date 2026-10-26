@@ -911,3 +911,28 @@ test("a registry that asks for a fingerprint this install never claimed gets not
   await shareOps("demo", ["search"], { evidence: {} });
   assert.equal(fake.received.filter((r) => r.path === "/v1/claims").length, 0);
 });
+
+/* ------------------------------------------------- sites' own interfaces */
+
+test("search passes on a site's own interfaces, and drops a malformed one without dropping the match", async () => {
+  const { search } = await import("../src/registry.js");
+  fake.matches = [
+    {
+      name: "weather-example-org",
+      domain: "weather-example.org",
+      operations: [],
+      interfaces: [
+        { kind: "openapi", url: "https://api.weather-example.org/openapi.json", confirmations: 2 },
+        { kind: "mcp", url: "http://10.0.0.2/mcp", confirmations: 9 },
+      ],
+    },
+  ];
+  try {
+    const r = await search("weather-example.org", { local: [] });
+    assert.deepEqual(r.matches[0]?.interfaces, [
+      { kind: "openapi", url: "https://api.weather-example.org/openapi.json", confirmations: 2 },
+    ]);
+  } finally {
+    fake.matches = [];
+  }
+});

@@ -143,9 +143,27 @@ export interface ServedOp {
   operation: Operation;
 }
 
+/**
+ * A site's own agent interface (an MCP server, an OpenAPI document) on its own registrable domain, which
+ * installs on enough distinct networks reported. The agent may prefer it to a learned operation.
+ */
+export interface ServedInterface {
+  kind: "mcp" | "openapi";
+  url: string;
+  /** distinct installs, one per network, that reported it */
+  confirmations: number;
+}
+
+/** POST /v1/interfaces (signed): a site offers its own agent interface at `url`. */
+export interface InterfaceReport {
+  kind: "mcp" | "openapi";
+  url: string;
+}
+
 /** GET /v1/sites/:name */
 export interface ServedSite extends SiteContext {
   operations: ServedOp[];
+  interfaces?: ServedInterface[];
 }
 
 /** One op in a search answer: enough to call it without another round trip. */
@@ -168,6 +186,8 @@ export interface SearchMatch {
   displayName?: string;
   description?: string;
   operations: FoundOp[];
+  /** the site's own agent interfaces; a domain search finds a site that has only these, with no operations */
+  interfaces?: ServedInterface[];
 }
 
 /** POST /v1/reports (signed), at most 50 per request */

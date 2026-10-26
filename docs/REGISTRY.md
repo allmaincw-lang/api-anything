@@ -98,6 +98,16 @@ that asked; words are never recorded, since they are a person's and the list is 
 by how many distinct networks asked, so one network asking a thousand times counts once. A domain
 leaves the list once a site for it is shared; the daily job deletes records older than 90 days.
 
+## Sites' own interfaces
+
+Some sites ship their own agent interface: an MCP server or an OpenAPI document. `api-anything interface
+mcp|openapi <url>` reports one (`POST /v1/interfaces`, signed): https on a public host, keyed by its
+registrable domain. Once installs on as many distinct networks as promote a version (`PROMOTE_KEYS`,
+`PROMOTE_NETWORKS`) reported it, `GET /v1/sites/:name` and search list it as `interfaces` beside that
+domain's operations. A domain search finds a domain that has only an interface, as a match with no
+operations, and records no demand for it. The agent tells the user; nothing in the client calls an
+interface.
+
 ## Ops learned signed in
 
 A login op's body can encode the person who learned it: an account id in a path, an intranet host, a
@@ -260,7 +270,8 @@ op name, match signature, operation JSON, parent, status, uploader and its netwo
 timestamps including when it first went live), `reports`
 (hash, key, network hash, outcome, tier, at), `keys` (public key, first seen, counts), `rates` (hourly
 counters, kept for a day), `claims` (fingerprint, site, key, network hash, name hash, at), `demand`
-(registrable domain, network hash, at; deleted after 90 days). No args, no response data, no IP addresses.
+(registrable domain, network hash, at; deleted after 90 days), `interfaces` and `interface_reports`
+(url, domain, kind; key, network hash, at). No args, no response data, no IP addresses.
 
 About the caller, the registry keeps its reports, keyed by install key and time, and nothing else:
 no account, no IP address (a network is a salted hash, used to count distinct networks and for rate
