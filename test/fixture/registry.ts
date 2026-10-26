@@ -76,6 +76,8 @@ export async function startRegistry() {
     down: false,
     /** every request is left unanswered */
     hang: false,
+    /** hung requests whose client gave up on them */
+    abandoned: 0,
     /** how POST /v1/versions answers an upload; by default new, candidate for a public read, else review */
     onUpload: (u: VersionUpload): { status: number; body: UploadResult | { error: string; reasons?: string[] } } => {
       const pub =
@@ -114,7 +116,7 @@ export async function startRegistry() {
         res.writeHead(status, { "content-type": "application/json" }).end(JSON.stringify(v));
       const raw = fake.raw.get(path);
       if (raw) return res.writeHead(raw.status, raw.headers ?? {}).end(raw.body);
-      if (fake.hang) return;
+      if (fake.hang) return void res.on("close", () => fake.abandoned++);
       if (fake.down) return send(503, { error: "down" });
       const u = new URL(path, "http://x");
       if (method === "GET" && u.pathname === "/v1/search") return send(200, { matches: fake.matches });

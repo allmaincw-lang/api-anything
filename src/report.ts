@@ -56,13 +56,17 @@ export async function flushReports(signal = stopper.signal): Promise<void> {
 /** Wait for the background work, then flush, for at most `ms`; what is left then is stopped. */
 export async function settle(ms: number): Promise<void> {
   let timer: NodeJS.Timeout | undefined;
+  let finished = false;
   const done = (async () => {
     while (pending.size) await Promise.all(pending);
     await flushReports();
-  })();
+  })().finally(() => {
+    finished = true;
+  });
   await Promise.race([done, new Promise<void>((r) => (timer = setTimeout(r, ms)))]);
   clearTimeout(timer);
-  if (pending.size || queue.length) {
+  // a flush in flight has already emptied the queue, and is no pending task: stop it too
+  if (!finished) {
     stopper.abort();
     stopper = new AbortController();
     queue.length = 0;
