@@ -12,10 +12,11 @@ import {
   profileCookies,
 } from "./browser.js";
 import { type Class, judge } from "./classify.js";
-import { asText } from "./codec.js";
-import { capOutput } from "./extract.js";
+import { asText, fillTemplate } from "./codec.js";
+import { capOutput, getPath } from "./extract.js";
 import {
   type Attempt,
+  challengePage,
   firedNothing,
   type HealResult,
   healOperation,
@@ -90,6 +91,7 @@ export type Retry = "no" | "safe" | "after_wait" | "after_fix";
 export type NextAction =
   | "retry"
   | "login"
+  | "sign_in_browser"
   | "heal"
   | "relearn"
   | "fix_args"
@@ -109,6 +111,12 @@ export interface NextCall {
   mode?: "window";
   /** raise_tier: the tier the call needs */
   tier?: Tier;
+  /**
+   * sign_in_browser: the everyday browser profile the session is imported from ("Chrome/Profile 1"),
+   * where the user signs in again by hand. A re-import from it brought back the same login cookies, so
+   * `login` would only import them once more; the call re-imports by itself on the retry.
+   */
+  profile?: string;
 }
 
 export interface CallResult {
@@ -118,6 +126,13 @@ export interface CallResult {
   /** extracted, picked, capped */
   data?: unknown;
   truncated?: string;
+  /**
+   * reads with `paging.next` only: the value to pass as the op's paging param for the next page,
+   * as the site's answer gave it
+   */
+  nextPage?: string | number;
+  /** true with nextPage; false when the site's answer says this is the last page; absent when it says neither */
+  hasMore?: boolean;
   tier?: Tier;
   healed?: boolean;
   ms: number;
@@ -127,7 +142,8 @@ export interface CallResult {
   /**
    * writes only, ok or not: `not_sent` nothing left; `not_applied` the site answered that it did not
    * run it; `accepted` a 2xx judged ok (proof the site took it, not that it took effect);
-   * `may_have_applied` anything else that may have reached the site
+   * `may_have_applied` anything else that may have reached the site; `applied` the op's readback
+   * found it after it was sent (always ok)
    */
   write?: WriteStatus;
   /** failures only; never `safe` or `after_wait` for a write that is accepted or may_have_applied */
@@ -177,7 +193,8 @@ export function stepOf(a: Attempt): Partial<Result> {
   const wait = a.retryAfterMs !== undefined ? { retryAfterMs: a.retryAfterMs } : {};
   if (a.hint === PROFILE_HINT) return { ...wait, nextCall: { action: "retry" }, retry: "after_wait" };
   if (a.step) return { ...wait, nextCall: { action: a.step } };
-  if (a.rejected) return { ...wait, nextCall: { action: "fix_args" } };
+  // refused for its args; a refusal that says the session is gone or names a limit keeps its class's step
+  if (a.rejected && a.class === "error") return { ...wait, nextCall: { action: "fix_args" } };
   return wait;
 }
 
@@ -229,7 +246,14 @@ export function finish(r: Result, op: Operation | undefined, site: string | unde
   return out;
 }
 
-function nextFor(c: CallResult["class"], site: string, op: Operation, a?: Attempt): string | undefined {
+/** `signIn`: how the user signs in again, when it is not `api-anything login` (`reimportIfBrowser`) */
+function nextFor(
+  c: CallResult["class"],
+  site: string,
+  op: Operation,
+  a?: Attempt,
+  signIn = `run: api-anything login ${site}`,
+): string | undefined {
   if (c === "ok") return undefined;
   if (c === "refused")
     return "only if the user asked for this write: rerun with --allow-writes (MCP: start the server with --allow-writes)";
@@ -237,11 +261,11 @@ function nextFor(c: CallResult["class"], site: string, op: Operation, a?: Attemp
   // A write the server may have run: never invite a second send.
   const ran = !op.readOnly && a !== undefined && statusOf(a) === "may_have_applied";
   if (ran && c !== "drift" && c !== "auth") return "the write may have gone through: check the site before any retry";
-  if (a?.rejected)
+  if (a?.rejected && c === "error")
     return `the site refused the write, so it did not run: read reason, check the args against: api-anything ops ${site}; do not send it again unchanged`;
   switch (c) {
     case "auth":
-      return `ask the user to run: api-anything login ${site}; then ${ran ? "check the site, and retry only if the write is not there" : "retry once"}`;
+      return `ask the user to ${signIn}; then ${ran ? "check the site, and retry only if the write is not there" : "retry once"}`;
     case "rate":
       return a?.retryAfterMs !== undefined
         ? "rate limited: do not retry before retryAfterMs (the time in reason)"
@@ -259,13 +283,21 @@ function nextFor(c: CallResult["class"], site: string, op: Operation, a?: Attemp
   }
 }
 
-const success = (a: Attempt, extra: Partial<Result> = {}): Result => ({
-  ok: true,
-  class: "ok",
-  tier: a.tier,
-  ...capOutput(a.data),
-  ...extra,
-});
+function success(a: Attempt, extra: Partial<Result> = {}): Result {
+  const capped = capOutput(a.data);
+  // the site's cursor points past the page it sent, not past what fitted in the output
+  if (capped.truncated && a.nextPage !== undefined)
+    capped.truncated += "; nextPage starts after the last item of this page, cut or not";
+  return {
+    ok: true,
+    class: "ok",
+    tier: a.tier,
+    ...capped,
+    ...(a.nextPage !== undefined ? { nextPage: a.nextPage } : {}),
+    ...(a.hasMore !== undefined ? { hasMore: a.hasMore } : {}),
+    ...extra,
+  };
+}
 
 /** The op's stored example args, with defaults; undefined when a required param has none. */
 function exampleArgs(op: Operation): Record<string, unknown> | undefined {
@@ -332,6 +364,7 @@ async function tryTier(ctx: Ctx, op: Operation, tier: Tier): Promise<Attempt> {
       const a: Attempt =
         judged ||
         resent ||
+        challengePage(run.capture) ||
         (run.loginWall
           ? { tier, class: "auth", reason: `the trigger landed on a sign-in page (${run.loginWall})` }
           : (pageDown(run.capture) ?? {
@@ -381,7 +414,17 @@ async function tryTier(ctx: Ctx, op: Operation, tier: Tier): Promise<Attempt> {
         redirect: (from, status, location, taken) => nextHop(op, session, from, status, location, taken),
       });
     }
-    return { tier, status: r.status, ...(r.redirected ? { redirected: true } : {}), ...judge(op, r) };
+    const j = judge(op, r);
+    const hint = j.unfinished
+      ? `the site wants a page finished first (consent, terms, or verify it's you): ask the user to open ${j.unfinished} in their browser and finish it, then run api-anything login ${ctx.site}; then retry once`
+      : undefined;
+    return {
+      tier,
+      status: r.status,
+      ...(r.redirected ? { redirected: true } : {}),
+      ...j,
+      ...(hint ? { hint, step: "login" as const } : {}),
+    };
   } catch (e) {
     // nothing was sent when the browser could not start
     if (e instanceof ProfileInUse) return { tier, class: "error", reason: e.message, hint: PROFILE_HINT, unsent: true };
@@ -523,8 +566,9 @@ async function onDrift(ctx: Ctx, site: Site, op: Operation, a: Attempt): Promise
     if (op.readOnly && a.tier < 3 && ctx.maxTier >= 3 && stale?.tier3 !== false && browserAvailable()) {
       const b = await attempt(ctx, op, 3);
       if (b.class === "ok") return success(b, { reason: guard });
-      // the site's own request doesn't answer either: stop paying a browser run per call
-      if (!b.hint && b.class !== "auth" && !b.server)
+      // the site's own request doesn't answer either: stop paying a browser run per call (a challenge,
+      // a limit or a sign-in page says nothing about that)
+      if (!b.hint && !learnedNothing(b))
         markStale(ctx.site, op.name, stale?.reason ?? guard, undefined, undefined, { tier3: false });
     }
     // `heal` refuses writes: a stale write is re-learned
@@ -619,10 +663,58 @@ function resolve(siteName: string, opName: string): { site: Site; op: Operation;
   return { site: r.site, op, theirs: r.source !== "user" || !!r.site.shared };
 }
 
+/**
+ * A write's readback: the op's read, run once after the write was sent. It is a read, never a
+ * resend. Finding the write makes the result `applied` (and ok, whatever its own answer was); not
+ * finding it, or a read that fails, changes nothing but `reason`: the site may show it later.
+ */
+async function readBack(
+  site: string,
+  op: Operation,
+  args: Record<string, unknown>,
+  r: Result,
+  opts: CallOptions,
+): Promise<Result> {
+  const rb = op.readback!;
+  const readArgs = Object.fromEntries(Object.entries(rb.args).map(([k, v]) => [k, fillTemplate(v, args)]));
+  const read = await call(site, rb.op, readArgs, {
+    ...opts,
+    allowWrites: false,
+    again: undefined,
+    idempotencyKey: undefined,
+  });
+  const noted = (note: string): Result => ({ ...r, reason: r.reason ? `${r.reason}; ${note}` : note });
+  if (!read.ok)
+    return noted(
+      `could not read it back with ${rb.op} (${read.class}: ${read.reason ?? "no reason"}), so it stays ${r.write}`,
+    );
+  const items = Array.isArray(read.data) ? read.data : read.data == null ? [] : [read.data];
+  const want = rb.find && fillTemplate(rb.find.equals, args).trim();
+  const found = rb.find
+    ? items.some((item) => {
+        const v = getPath(item, rb.find!.field);
+        return v != null && typeof v !== "object" && asText(v).trim() === want;
+      })
+    : !(read.data == null || read.data === "" || (typeof read.data === "object" && !Object.keys(read.data).length));
+  if (!found)
+    return noted(
+      `read back with ${rb.op}: not found${read.truncated ? " in the part of its answer that fitted" : ""}, so it stays ${r.write}: the site may not show it yet; check the site before any retry`,
+    );
+  const { retry: _retry, nextCall: _next, next: _hint, server: _server, ...kept } = r;
+  const note = `read back with ${rb.op}: found it`;
+  return { ...kept, ok: true, class: "ok", write: "applied", reason: r.reason ? `${r.reason}; ${note}` : note };
+}
+
 /** The answer to a write the ledger held back: nothing is sent. */
 function heldBack(g: Exclude<WriteGate, { send: true }>, op: Operation): Result {
   const when = new Date(g.earlier.at).toISOString();
   const was: WriteStatus = g.earlier.status === "sending" ? "may_have_applied" : g.earlier.status;
+  const did =
+    was === "applied"
+      ? "a read back found it"
+      : was === "accepted"
+        ? "the site accepted it"
+        : "it may have gone through";
   const again = "repeat the call with again (CLI --again, MCP again: true)";
   if (g.why === "key_reused")
     return {
@@ -633,12 +725,12 @@ function heldBack(g: Exclude<WriteGate, { send: true }>, op: Operation): Result 
       next: "give each different write its own idempotency key",
     };
   if (g.why === "replay") {
-    const ok = g.earlier.ok === true && was === "accepted";
+    const ok = g.earlier.ok === true && (was === "accepted" || was === "applied");
     return {
       ok,
       class: ok ? "ok" : ((g.earlier.class as CallResult["class"] | undefined) ?? "error"),
       write: was,
-      reason: `not sent again: this idempotency key was sent at ${when}, and this is that call's record (${was === "accepted" ? "the site accepted it" : "it may have gone through"})`,
+      reason: `not sent again: this idempotency key was sent at ${when}, and this is that call's record (${did})`,
       ...(ok ? {} : { next: "the write may have gone through: check the site before any retry" }),
     };
   }
@@ -646,7 +738,7 @@ function heldBack(g: Exclude<WriteGate, { send: true }>, op: Operation): Result 
     ok: false,
     class: "duplicate",
     write: "not_sent",
-    reason: `not sent: the same write (same args) was sent at ${when} and ${was === "accepted" ? "the site accepted it" : "may have gone through"}`,
+    reason: `not sent: the same write (same args) was sent at ${when} and ${did}`,
     next: `check the site: the write is probably there. Only if it is not, and the user wants it sent again, ${again}`,
   };
 }
@@ -665,8 +757,11 @@ export async function call(
   let jar: Session | undefined;
   /** this write's ledger record, settled with what the call did */
   let ledger: string | undefined;
-  const done = (r: Result): CallResult => {
-    const f = finish(r, resolved, resolved ? siteName : undefined, log);
+  const done = async (r: Result): Promise<CallResult> => {
+    let f = finish(r, resolved, resolved ? siteName : undefined, log);
+    // log: something was sent this call (a ledger hold-back sends nothing, and reads nothing back)
+    if (resolved?.readback && log.length && (f.write === "accepted" || f.write === "may_have_applied"))
+      f = await readBack(siteName, resolved, args, f, opts);
     const sessions = [jar, resolved ? sessionOrNone(siteName) : undefined];
     if (f.reason) f.reason = hide(f.reason, sessions, true);
     if (f.next) f.next = hide(f.next, sessions);
@@ -724,6 +819,35 @@ export async function call(
         : nextFor("input", siteName, op);
     return done({ ok: false, class: "input", reason: (e as Error).message, next });
   }
+  // auth recovery steps taken this call: 1 re-import, 2 the profile's cookies, 3 a trigger run
+  let authStep = 0;
+  /** where the user signs in again when a re-import brought back no new login (`reimportIfBrowser`) */
+  let signIn: { text: string; step: NextCall } | undefined;
+  const reimport = async () => {
+    authStep = 1;
+    const r = await reimportIfBrowser(siteName, op.request.url, site.loginCookies);
+    signIn =
+      r.signIn && r.profile ? { text: r.signIn, step: { action: "sign_in_browser", profile: r.profile } } : undefined;
+    return r.renewed;
+  };
+  // A write learned signed in, with no live login cookie in the jar (expired, or never there), would be
+  // refused, or run as a guest: re-import first, and send nothing while none is back. Before the
+  // duplicate guard records it, since it is not sent. The check leaves `guestCookies` out: a spec
+  // learned before they were recorded, or on someone else's machine, may have counted a guest name as
+  // its login, and a signed-in write must not be refused for that. A guest's write the server answers
+  // 401 or 403 is still retried as below.
+  if (write && op.learnedLoggedIn && !loggedIn(session.cookies, site.loginCookies)) {
+    await reimport();
+    if (!loggedIn(loadSession(siteName).cookies, site.loginCookies))
+      return done({
+        ok: false,
+        class: "auth",
+        reason: `${op.name} is a write learned signed in, and the session holds no live login cookie (expired or missing)${signIn ? `, nor does a re-import bring one back` : ""}: nothing was sent`,
+        next: nextFor("auth", siteName, op, undefined, signIn?.text),
+        write: "not_sent",
+        ...(signIn ? { nextCall: signIn.step } : {}),
+      });
+  }
   if (write) {
     let gate: WriteGate | undefined;
     try {
@@ -751,7 +875,7 @@ export async function call(
     if (op.slots.some(holdsRef) || op.learnedLoggedIn) return false;
     try {
       const s = loadSession(siteName);
-      return !s.source && !loggedIn(s.cookies, site.loginCookies);
+      return !s.source && !loggedIn(s.cookies, site.loginCookies, s.guestCookies);
     } catch {
       return false;
     }
@@ -763,8 +887,6 @@ export async function call(
   // Why a call ran above tier 1, so a slow call explains itself.
   const notes: string[] = tier > op.minTier ? [`started at tier ${tier}: an earlier call escalated there`] : [];
   const noted = (a: Attempt) => success(a, notes.length ? { reason: notes.join("; ") } : {});
-  // auth recovery steps taken this call: 1 re-import, 2 the profile's cookies, 3 a trigger run
-  let authStep = 0;
   let examplesChecked = false;
   for (;;) {
     if (tier > ctx.maxTier) {
@@ -796,13 +918,14 @@ export async function call(
       return done(noted(a));
     }
     const reason = a.note ? `${a.reason}; ${a.note}` : a.reason;
-    const fail = (): CallResult =>
+    const fail = (): Promise<CallResult> =>
       done({
         ok: false,
         class: a.class,
         tier,
         reason,
-        next: nextFor(a.class, siteName, op, a),
+        next: nextFor(a.class, siteName, op, a, signIn?.text),
+        ...(a.class === "auth" && signIn ? { nextCall: signIn.step } : {}),
         ...stepOf(a),
         ...(a.server ? { server: true as const } : {}),
       });
@@ -838,10 +961,7 @@ export async function call(
       // An imported session is a mirror of the everyday browser: silently re-import from the same
       // profile once (browserless), in case the human re-signed in there. It lands in the jar and
       // in the Chrome profile tiers 2 and 3 send from. Then retry.
-      if (authStep < 1) {
-        authStep = 1;
-        if (await reimportIfBrowser(siteName, op.request.url, site.loginCookies)) continue;
-      }
+      if (authStep < 1 && (await reimport())) continue;
       // tier 3 ran the site's own page: the profile's cookies and session values are what it just used
       if (tier === 3 || ctx.maxTier <= 1) return fail();
       if (authStep < 2) {

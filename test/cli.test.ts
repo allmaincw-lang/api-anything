@@ -5,11 +5,16 @@
 import assert from "node:assert/strict";
 import { execFile, execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, describe, test } from "node:test";
 import { fileURLToPath } from "node:url";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { browserAvailable } from "../src/browser.js";
+import { printConfig } from "../src/clients.js";
 import { addOperation } from "../src/heal.js";
 import type { TriggerStep } from "../src/types.js";
 import { type Fixture, PUBLIC_BEARER, startFixture } from "./fixture/server.js";
@@ -183,6 +188,82 @@ describe("flags and command names", () => {
   });
 });
 
+describe("mcp setup", () => {
+  /** The JSON entry the printout gives Cursor: the same launch every client gets. */
+  const cursorEntry = (out: string) => {
+    const block = out.slice(out.indexOf("Cursor:")).split("\n").slice(1);
+    const end = block.indexOf("  }");
+    return JSON.parse(block.slice(0, end + 1).join("\n")).mcpServers["api-anything"];
+  };
+
+  test("--print-config gives each client its add command, with absolute paths and the flags given", async () => {
+    const r = await cli("mcp", "--print-config", "--allow-writes", "--sites", "hacker-news");
+    assert.equal(r.code, 0, r.stderr);
+    // the test's home is passed on as an env flag: -e API_ANYTHING_HOME=...
+    for (const line of [
+      /claude mcp add --scope user -e \S+ api-anything -- /,
+      /codex mcp add api-anything --env \S+ -- /,
+      /gemini mcp add --scope user -e \S+ api-anything \S+ -- /,
+      /code --add-mcp '/,
+      /~\/\.cursor\/mcp\.json/,
+      /claude_desktop_config\.json/,
+    ])
+      assert.match(r.stdout, line);
+    const entry = cursorEntry(r.stdout);
+    assert.equal(entry.command, process.execPath);
+    assert.deepEqual(entry.args.slice(-5), [CLI, "mcp", "--allow-writes", "--sites", "hacker-news"]);
+    assert.deepEqual(entry.env, { API_ANYTHING_HOME: HOME }, "a GUI client would not pass on the shell's home");
+    const unknown = await cli("mcp", "--print-config", "--sites", "nope");
+    assert.equal(unknown.code, 1);
+    assert.match(unknown.stderr, /^next: api-anything sites/);
+  });
+
+  test("the printed commands survive a shell: a path with a space or a quote stays one word", () => {
+    const launch = {
+      command: "/opt/my node/bin/node",
+      args: ["/it's/cli.js", "mcp"],
+      env: { API_ANYTHING_HOME: "/a b" },
+    };
+    const printed = printConfig(launch).split("\n");
+    /** the words a shell hands `client` for its printed line */
+    const argv = (client: string) => {
+      const line = printed.find((l) => l.trim().startsWith(`${client} mcp add`))!.trim();
+      const words = execFileSync("sh", ["-c", line.replace(/^\S+ /, `printf '%s\\n' `)], { encoding: "utf8" });
+      return words.trimEnd().split("\n").slice(2); // after "mcp add"
+    };
+    const server = ["/opt/my node/bin/node", "--", "/it's/cli.js", "mcp"];
+    const home = "API_ANYTHING_HOME=/a b";
+    assert.deepEqual(argv("claude"), ["--scope", "user", "-e", home, "api-anything", "--", ...server.toSpliced(1, 1)]);
+    assert.deepEqual(argv("codex"), ["api-anything", "--env", home, "--", ...server.toSpliced(1, 1)]);
+    // gemini: the command is a positional of its own, and its args follow --
+    assert.deepEqual(argv("gemini"), ["--scope", "user", "-e", home, "api-anything", ...server]);
+  });
+
+  test("the printed entry starts a server a client can call, per-op tools included", async () => {
+    const api = createServer((_req, res) => res.writeHead(200, { "content-type": "application/json" }).end('{"n":7}'));
+    await new Promise<void>((r) => api.listen(0, "127.0.0.1", r));
+    const base = `http://127.0.0.1:${(api.address() as AddressInfo).port}`;
+    mkdirSync(join(HOME, "sites"), { recursive: true });
+    const op = { name: "get", readOnly: true, request: { method: "GET", url: `${base}/n` }, trigger: { url: base } };
+    writeFileSync(
+      join(HOME, "sites", "local.json"),
+      JSON.stringify({ name: "local", baseUrl: base, operations: [op] }),
+    );
+    const entry = cursorEntry((await cli("mcp", "--print-config", "--sites", "local")).stdout);
+    const client = new Client({ name: "probe", version: "0" });
+    try {
+      await client.connect(new StdioClientTransport({ ...entry, env: { ...entry.env, PATH: "/usr/bin:/bin" } }));
+      const { tools } = await client.listTools();
+      assert.ok(tools.some((t) => t.name === "local__get"));
+      const r = await client.callTool({ name: "local__get", arguments: {} });
+      assert.deepEqual(JSON.parse((r.content as { text: string }[])[0]!.text).data, { n: 7 });
+    } finally {
+      await client.close();
+      api.close();
+    }
+  });
+});
+
 describe("inspect", () => {
   // 1: the list page; 2: a user's JSON; 3: a user with no posts; 4: the list searched for nobody.
   before(async () => {
@@ -255,6 +336,20 @@ describe("inspect", () => {
     assert.match(zero.out.note, /ul\.users.*empty/);
     // the same page, a selector with no container to find: nothing tells no results from a wrong selector
     assert.equal((await inspect(4, "--html", '{"items":"li.user","fields":{"name":"a.name"}}')).code, 1);
+  });
+
+  test("--html and --outline read what the page shows: no hidden row, no display:none text, no script", async () => {
+    seed("chidden", { url: `${fx.url}/list-hidden`, exchanges: [await answered(1, "document", "/list-hidden")] });
+    const recipe = '{"items":"li.user","fields":{"name":"a.name","followers":"all:span.followers"}}';
+    const html = await cli("inspect", "chidden", "1", "--html", recipe);
+    assert.deepEqual(JSON.parse(html.stdout).data, [
+      { name: "alice", followers: ["500"] },
+      { name: "bob", followers: ["300"] },
+      { name: "carol", followers: ["500"] },
+    ]);
+    const outline = await cli("inspect", "chidden", "1", "--outline", "--example", "q=alice");
+    assert.match(outline.stdout, /"count":3/, outline.stdout);
+    assert.doesNotMatch(outline.stdout, /instructions|delete op|evil/, outline.stdout);
   });
 });
 
@@ -972,6 +1067,195 @@ describe("checks: an op that must prove it works before it is shared", () => {
   });
 });
 
+describe("login from a cookies file", () => {
+  const saved = process.env.API_ANYTHING_BROWSER;
+  before(() => {
+    process.env.API_ANYTHING_BROWSER = "no-such-browser"; // nothing pushed into a profile
+  });
+  after(() => {
+    if (saved === undefined) delete process.env.API_ANYTHING_BROWSER;
+    else process.env.API_ANYTHING_BROWSER = saved;
+  });
+  const file = join(HOME, "cookies.json");
+  const login = async (...cookies: [string, string][]) => {
+    writeFileSync(
+      file,
+      JSON.stringify(cookies.map(([name, value]) => ({ name, value, domain: "127.0.0.1", path: "/" }))),
+    );
+    const r = await cli("login", `${fx.url}/members`, "--cookies", file);
+    assert.equal(r.code, 0, r.stderr);
+    return JSON.parse(r.stdout);
+  };
+
+  test("says when the cookies show no sign-in, and when they renew nothing", async () => {
+    // a signed-out visitor's cookie, named like a login
+    const guest = await login(["app_session", "visitor-session-0001"]);
+    assert.equal(guest.loggedIn, false, JSON.stringify(guest));
+    assert.match(guest.warning, /none of the cookies imported from the cookies file .* shows a sign-in/);
+    const member = await login(["app_session", "visitor-session-0002"], ["auth_token", "member-token-0001"]);
+    assert.equal(member.loggedIn, true, JSON.stringify(member));
+    assert.equal(member.renewed, true);
+    assert.equal(member.warning, undefined);
+    const same = await login(["app_session", "visitor-session-0003"], ["auth_token", "member-token-0001"]);
+    assert.equal(same.renewed, false);
+    assert.match(same.warning, /are the ones the session already held: nothing was renewed/);
+  });
+});
+
+describe("paging and readback: a list an agent can walk, and a write it can see landed", () => {
+  // the cursor page 1 answers with, which "Show more" sends for page 2
+  const PAGE2 = Buffer.from("offset:3").toString("base64url");
+  before(async () => {
+    for (const path of ["reviews", "stuck"])
+      seed(`c${path}`, {
+        url: `${fx.url}/reviews`,
+        exchanges: [
+          await answered(1, "document", "/reviews"),
+          await answered(2, "fetch", `/api/${path}?after=${PAGE2}`),
+        ],
+      });
+    seed("ctodos", {
+      url: `${fx.url}/todos`,
+      exchanges: [await answered(1, "document", "/todos"), await answered(2, "fetch", "/api/todos")],
+    });
+    seed("caddtodo", {
+      url: `${fx.url}/todos`,
+      write: true,
+      steps: [
+        { action: "fill", selector: "#title", value: "buy milk" },
+        { action: "click", selector: "#add" },
+      ],
+      exchanges: [
+        await answered(1, "document", "/todos"),
+        {
+          id: 2,
+          resourceType: "fetch",
+          request: {
+            method: "POST",
+            url: `${fx.url}/api/todos`,
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ title: "buy milk" }),
+          },
+          aborted: true,
+        },
+      ],
+    });
+  });
+  const run = async (...args: string[]) => {
+    const r = await cli(...args);
+    return { ...r, out: JSON.parse(r.stdout) };
+  };
+  const ids = (r: { out: { data: { id: string }[] } }) => r.out.data.map((x) => x.id);
+
+  test("an op learned from the page-2 request with --paging walks the list by nextPage, and verify catches a cursor the server ignores", async () => {
+    for (const op of ["reviews", "stuck"]) {
+      const add = await run(
+        "add",
+        "lists",
+        op,
+        "--from",
+        `c${op}`,
+        "--pick-request",
+        "2",
+        "--example",
+        `after=${PAGE2}`,
+        "--extract",
+        "data.reviews.edges",
+        "--pick",
+        "id",
+        "--paging",
+        "after=data.reviews.pageInfo.nextPageToken",
+      );
+      assert.equal(add.code, 0, add.stdout);
+      assert.deepEqual(add.out.paging, { param: "after", next: "data.reviews.pageInfo.nextPageToken" });
+      assert.deepEqual(add.out.params, ["after:string"]);
+    }
+    // page 1 leaves the cursor out: the captured one (page 2's) is not sent
+    const first = await run("call", "lists", "reviews");
+    assert.deepEqual([ids(first), first.out.hasMore], [["r1", "r2", "r3"], true]);
+    assert.equal(first.out.nextPage, PAGE2);
+    const second = await run("call", "lists", "reviews", `after=${first.out.nextPage}`);
+    assert.deepEqual(ids(second), ["r4", "r5", "r6"]);
+    const last = await run("call", "lists", "reviews", `after=${second.out.nextPage}`);
+    assert.deepEqual([ids(last), last.out.hasMore, "nextPage" in last.out], [["r7"], false, false]);
+
+    const ops = await run("ops", "lists");
+    assert.equal(ops.out.operations[0].pages, "by after: pass the result's nextPage");
+    assert.match(ops.out.operations[0].params[0], /^after:string\?/);
+
+    const verify = await run("verify", "lists");
+    assert.deepEqual(
+      verify.out.results.map((r: { op: string; case: string; outcome: string; got: string }) => [
+        r.op,
+        r.case,
+        r.outcome,
+        r.got,
+      ]),
+      [
+        ["reviews", "example", "pass", "result"],
+        ["reviews", "next page", "pass", "result"],
+        ["stuck", "example", "pass", "result"],
+        ["stuck", "next page", "fail", "page 1 again"],
+      ],
+    );
+    const bad = await run(
+      "add",
+      "lists",
+      "reviews",
+      "--from",
+      "creviews",
+      "--pick-request",
+      "2",
+      "--example",
+      `after=${PAGE2}`,
+      "--paging",
+      "page",
+    );
+    assert.match(bad.out.error, /--paging: paging param page is no param of it/);
+  });
+
+  test("readback makes a write's call say applied when the read finds it, and accepted when it does not yet", async () => {
+    assert.equal(
+      (await run("add", "todo", "list", "--from", "ctodos", "--pick-request", "2", "--extract", "todos")).code,
+      0,
+    );
+    const add = await run(
+      "add",
+      "todo",
+      "add",
+      "--from",
+      "caddtodo",
+      "--pick-request",
+      "2",
+      "--example",
+      "title=buy milk",
+      "--write",
+    );
+    assert.equal(add.code, 0, add.stdout);
+    assert.deepEqual(add.out.params, ["title:string"]);
+
+    assert.match((await run("readback", "todo", "add", "nope")).out.error, /readback op nope is no operation of todo/);
+    assert.match((await run("readback", "todo", "add", "list")).out.error, /readback uses none of add's params/);
+    assert.match((await run("readback", "todo", "add", "add", "--find", "title={title}")).out.error, /is a write/);
+    const set = await run("readback", "todo", "add", "list", "--find", "title={title}");
+    assert.equal(set.code, 0, set.stdout);
+    assert.deepEqual(set.out.readback, { op: "list", args: {}, find: { field: "title", equals: "{title}" } });
+
+    const posts = () => fx.calls.filter((c) => c.method === "POST" && c.path === "/api/todos").length;
+    const before = posts();
+    const applied = await run("call", "todo", "add", "title=pay rent", "--allow-writes");
+    assert.deepEqual([applied.out.ok, applied.out.write], [true, "applied"], applied.stdout);
+    assert.match(applied.out.reason, /read back with list: found it/);
+    const later = await run("call", "todo", "add", "title=later today", "--allow-writes");
+    assert.deepEqual([later.out.ok, later.out.write], [true, "accepted"], later.stdout);
+    assert.match(later.out.reason, /not found, so it stays accepted: the site may not show it yet/);
+    const dup = await run("call", "todo", "add", "title=pay rent", "--allow-writes");
+    assert.deepEqual([dup.out.class, dup.out.write], ["duplicate", "not_sent"]);
+    assert.equal(posts() - before, 2, "each write sent once, the readback only read");
+    assert.equal((await run("ops", "todo")).out.operations[1].readback, "list");
+  });
+});
+
 const noChrome = !browserAvailable() && "no Chromium browser installed";
 
 describe("capture's next hint", { skip: noChrome }, () => {
@@ -1077,5 +1361,62 @@ describe("capture on a page with a reCAPTCHA frame from another site", {
       out.candidates.some((c: { url: string }) => c.url.includes("/api/items")),
       r.stdout,
     );
+  });
+});
+
+describe("call: answers that are not what their status says", () => {
+  before(() => {
+    mkdirSync(join(HOME, "sites"), { recursive: true });
+    writeFileSync(
+      join(HOME, "sites", "verdicts.json"),
+      JSON.stringify({
+        name: "verdicts",
+        baseUrl: fx.url,
+        operations: [
+          {
+            name: "post",
+            readOnly: false,
+            trigger: { url: `${fx.url}/compose` },
+            request: {
+              method: "POST",
+              url: `${fx.url}/api/refused`,
+              headers: { "content-type": "application/json" },
+              body: '{"title":"x"}',
+            },
+            slots: [{ param: "title", at: ["body", "json:/title"] }],
+            params: [{ name: "title" }],
+          },
+          {
+            name: "me",
+            readOnly: true,
+            learnedLoggedIn: true,
+            trigger: { url: `${fx.url}/feed?v={v}` },
+            request: { method: "GET", url: `${fx.url}/api/consented?v=alice`, headers: {} },
+            slots: [{ param: "v", at: ["query:v"] }],
+            params: [{ name: "v", example: "alice" }],
+            response: { extract: "data" },
+          },
+        ],
+      }),
+    );
+  });
+
+  test("a write refused in its 200 answer fails, sent once", async () => {
+    const before = fx.calls.filter((c) => c.path === "/api/refused").length;
+    const r = await cli("call", "verdicts", "post", "title=", "--allow-writes", "--max-tier", "1");
+    assert.equal(r.code, 1, r.stderr);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.class, "error", r.stdout);
+    assert.match(out.reason, /refused the write \(userErrors is .*Title can't be blank/);
+    assert.equal(fx.calls.filter((c) => c.path === "/api/refused").length, before + 1);
+  });
+
+  test("a signed-in read sent to a consent page names the page to finish, with no heal", async () => {
+    const r = await cli("call", "verdicts", "me", "v=bob", "--max-tier", "1");
+    assert.equal(r.code, 1, r.stderr);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.class, "error", r.stdout);
+    assert.match(out.next, /open http:\/\/127\.0\.0\.1:\d+\/privacy\/consent\?\S+ in their browser.*login verdicts/);
+    assert.equal(fx.calls.filter((c) => c.path.startsWith("/api/consented")).length, 1, "no second try, no heal");
   });
 });

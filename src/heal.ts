@@ -39,9 +39,10 @@ import {
   siteOf,
   writePrivate,
 } from "./session.js";
-import type { Match, Operation, Param, ResponseSpec, Site, Slot, Trigger, Volatile } from "./spec.js";
+import type { Match, Operation, Paging, Param, ResponseSpec, Site, Slot, Trigger, Volatile } from "./spec.js";
 import { appendHeal, clearStale, loadSite, rememberTier, updateSite } from "./store.js";
 import type { CaptureResult, Exchange, TriggerStep } from "./types.js";
+import { pagingProblems, readbackProblems } from "./vet.js";
 
 export const profileDir = () => join(home(), "profile");
 
@@ -52,6 +53,9 @@ export interface Attempt {
   reason: string;
   status?: number;
   data?: unknown;
+  /** see Judged.nextPage and Judged.hasMore */
+  nextPage?: string | number;
+  hasMore?: boolean;
   ambiguous?: boolean;
   /** the args may be the problem (data missing, or a bare 403); see Classified.missing */
   missing?: boolean;
@@ -352,13 +356,17 @@ export async function runOpTrigger(
   };
 }
 
+/** The page's last load: a redirect's end carries no #fragment, and a reload answers again. */
+function lastLoad(capture: CaptureResult): Exchange["response"] {
+  const page = capture.finalUrl.split("#")[0];
+  return capture.exchanges
+    .filter((e) => e.resourceType === "document" && e.response && e.request.url.split("#")[0] === page)
+    .at(-1)?.response;
+}
+
 /** The trigger page's own failure (a 5xx): its requests never fired, which says nothing about the op. */
 export function pageDown(capture: CaptureResult): Attempt | undefined {
-  // the page's last load: a redirect's end carries no #fragment, and a reload answers again
-  const page = capture.finalUrl.split("#")[0];
-  const status = capture.exchanges
-    .filter((e) => e.resourceType === "document" && e.response && e.request.url.split("#")[0] === page)
-    .at(-1)?.response?.status;
+  const status = lastLoad(capture)?.status;
   return status !== undefined && status >= 500
     ? { tier: 3, class: "error", status, server: true, reason: `the trigger page answered HTTP ${status}` }
     : undefined;
@@ -378,6 +386,13 @@ export function firedNothing(op: Operation, capture: CaptureResult): string {
       ? "it is not one this write's learning recorded"
       : "this write's learning recorded none";
   return `${no}: the page asked to confirm ${atStep(asked.step)} and was told no, since ${why}; nothing is confirmed on the user's behalf`;
+}
+
+/** The run ended on a bot challenge that did not solve: its requests never fired, which says nothing about the op. */
+export function challengePage(capture: CaptureResult): Attempt | undefined {
+  const doc = lastLoad(capture);
+  const wall = doc && botWall({ status: doc.status, headers: doc.headers, body: doc.body ?? "" });
+  return wall ? { tier: 3, class: "blocked", reason: `the trigger page stayed a bot challenge (${wall})` } : undefined;
 }
 
 /** A tier-3 result: the site's own request, answered. */
@@ -472,6 +487,8 @@ export interface AddInput {
   from2?: CaptureFile;
   /** by param name: the values it allows, set on top of what the op had */
   allowed?: Record<string, Pick<Param, "enum" | "min" | "max">>;
+  /** a read's paging, set on top of what the op had */
+  paging?: Paging;
   fetchImpl?: typeof fetch;
 }
 
@@ -814,6 +831,7 @@ export async function addOperation(input: AddInput): Promise<AddResult> {
       trigger,
       readOnly: !i.write,
       loginCookies: existing?.loginCookies,
+      guestCookies: loadSession(i.site).guestCookies,
       public: i.public,
       // With a response recipe, the request it resolves on is the answer (not a beacon echoing the page URL).
       ...(r.html || r.embedded || r.extract ? { accepts: (e: Exchange) => resolves(spec, e.response?.body) } : {}),
@@ -880,6 +898,31 @@ export async function addOperation(input: AddInput): Promise<AddResult> {
     params,
     ...(checks?.length && !i.write ? { checks } : {}),
   };
+  // Paging and a readback are the caller's contract too: kept while they still fit the op learned again.
+  const paging = i.paging ?? old?.paging;
+  if (paging && !i.write) {
+    // A cursor is left out for the first page, which is also what verify starts from: a captured
+    // cursor is no example (it can expire, or carry the session it was made for).
+    const paged: Operation = {
+      ...operation,
+      paging,
+      params: params.map((p) => {
+        if (!paging.next || p.name !== paging.param) return p;
+        const { example: _captured, ...cursor } = p;
+        return { ...cursor, required: false };
+      }),
+    };
+    const problems = pagingProblems(paged);
+    if (i.paging && problems.length) throw new Error(`--paging: ${problems.join("; ")}`);
+    if (!problems.length) operation = paged;
+  }
+  if (
+    old?.readback &&
+    i.write &&
+    existing &&
+    !readbackProblems(existing, { ...operation, readback: old.readback }).length
+  )
+    operation = { ...operation, readback: old.readback };
   const session = mergeCapture(
     i.site,
     (run2 ?? run1).cookies,
@@ -1231,6 +1274,8 @@ export async function healOperation(
       return { outcome: "failed", attempt: { tier: 3, class: "error", reason, server: true }, transient: true, reason };
     return { outcome: "failed", attempt: last, reason };
   }
+  const wall = run.matched ? undefined : challengePage(run.capture);
+  if (wall) return { outcome: "failed", attempt: wall, transient: true, reason: wall.reason };
   if (!run.matched && run.loginWall) {
     return {
       outcome: "failed",
@@ -1297,6 +1342,7 @@ export async function healOperation(
       trigger: op.trigger,
       readOnly: op.readOnly,
       loginCookies: o.loginCookies,
+      guestCookies: loadSession(site).guestCookies,
       public: op.public,
       established,
     }));
@@ -1328,6 +1374,8 @@ export async function healOperation(
     readOnly: op.readOnly,
     ...(op.public ? { public: op.public } : {}),
     ...(op.checks ? { checks: op.checks } : {}),
+    ...(op.paging ? { paging: op.paging } : {}),
+    ...(op.readback ? { readback: op.readback } : {}),
     ...(op.unproven ? { unproven: op.unproven } : {}),
     minTier: Math.max(op.minTier, fresh.minTier) as Operation["minTier"],
     response: {

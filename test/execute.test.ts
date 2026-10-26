@@ -3,12 +3,15 @@ import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { after, beforeEach, test } from "node:test";
+import { after, before, beforeEach, describe, test } from "node:test";
 import { type CallResult, call, finish, stepOf } from "../src/execute.js";
 import { type Attempt, PROFILE_HINT } from "../src/heal.js";
+import { buildRequest } from "../src/http.js";
 import { saveSession } from "../src/session.js";
 import { parseSite } from "../src/spec.js";
 import { saveSite, staleMark } from "../src/store.js";
+import type { StoredCookie } from "../src/types.js";
+import { makeChromiumDb } from "./fixture/cookie-db.js";
 
 const HOME = mkdtempSync(join(tmpdir(), "api-anything-exec-"));
 process.env.API_ANYTHING_HOME = HOME;
@@ -57,6 +60,7 @@ const fake = (h: Handler): typeof fetch =>
 const json = (v: unknown, status = 200) =>
   new Response(JSON.stringify(v), { status, headers: { "content-type": "application/json" } });
 const opts = (h: Handler) => ({ fetchImpl: fake(h), maxTier: 1 as const, minIntervalMs: 0 });
+const NO_SESSION = { cookies: [], values: {} };
 const heals = () => {
   try {
     return readFileSync(join(HOME, "heals.jsonl"), "utf8")
@@ -257,6 +261,209 @@ test("a write answered 204, HTML or plain text is ok, sent once", async () => {
     assert.equal(r.ok, true, JSON.stringify(r));
     assert.equal(seen.length, 1);
   }
+});
+
+describe("a session learned signed in", () => {
+  const members = parseSite({
+    name: "m",
+    baseUrl: "https://members.test",
+    operations: [
+      {
+        name: "me",
+        readOnly: true,
+        request: { method: "GET", url: "https://members.test/api/me", headers: {} },
+        trigger: { url: "https://members.test/" },
+        response: { extract: "data" },
+        learnedLoggedIn: true,
+      },
+      {
+        name: "post",
+        readOnly: false,
+        request: { method: "POST", url: "https://members.test/api/post", headers: {}, body: "x" },
+        trigger: { url: "https://members.test/compose" },
+        learnedLoggedIn: true,
+      },
+    ],
+  });
+  const token = (value: string, extra: Partial<StoredCookie> = {}): StoredCookie => ({
+    name: "auth_token",
+    value,
+    domain: ".members.test",
+    path: "/",
+    expires: -1,
+    httpOnly: true,
+    secure: false,
+    ...extra,
+  });
+  const browser = mkdtempSync(join(tmpdir(), "api-anything-exec-browser-"));
+  /** what the everyday browser's Chrome "Default" profile holds for the site */
+  const profile = (...rows: { name: string; value: string }[]) =>
+    makeChromiumDb(
+      join(browser, "Default"),
+      rows.map((r) => ({ host_key: ".members.test", ...r })),
+      { password: "pw" },
+    );
+  /** the server takes only this login */
+  let live = "";
+  const server: Handler = (url, init) =>
+    new Headers(init?.headers).get("cookie")?.includes(`auth_token=${live}`)
+      ? json(url.endsWith("/me") ? { data: { name: "alice" } } : { ok: true })
+      : json({ error: "unauthenticated" }, 401);
+  const write = (): Promise<CallResult> => call("m", "post", {}, { ...opts(server), allowWrites: true });
+  before(() => {
+    process.env.API_ANYTHING_BROWSER = "no-such-browser"; // a re-import pushes into no browser profile
+    process.env.API_ANYTHING_BROWSER_ROOTS = JSON.stringify([
+      { name: "Chrome", family: "chromium", root: browser, password: "pw" },
+    ]);
+  });
+  beforeEach(() => saveSite(members));
+  after(() => {
+    delete process.env.API_ANYTHING_BROWSER;
+    delete process.env.API_ANYTHING_BROWSER_ROOTS;
+    rmSync(browser, { recursive: true, force: true });
+  });
+
+  test("a write is not sent while the session holds no live login cookie, and is once one is back", async () => {
+    live = "token-live-0001";
+    saveSession("m", { cookies: [token(live, { expires: 1 })], values: {} });
+    const expired = await write();
+    assert.equal(expired.class, "auth");
+    assert.equal(seen.length, 0, "nothing sent");
+    assert.match(
+      expired.reason ?? "",
+      /learned signed in.*no live login cookie \(expired or missing\): nothing was sent/,
+    );
+    assert.match(expired.next ?? "", /ask the user to run: api-anything login m; then retry once/);
+    assert.deepEqual(
+      [expired.write, expired.retry, expired.nextCall],
+      ["not_sent", "after_fix", { action: "login", site: "m", op: "post" }],
+    );
+
+    // imported from a browser profile that is signed out too: still nothing sent, and where to sign in
+    profile({ name: "theme", value: "dark" });
+    saveSession("m", { cookies: [], values: {}, source: "chrome:Default" });
+    const out = await write();
+    assert.equal(out.class, "auth");
+    assert.equal(seen.length, 0, "nothing sent");
+    assert.match(out.reason ?? "", /nor does a re-import bring one back: nothing was sent/);
+    assert.match(
+      out.next ?? "",
+      /ask the user to sign in to members\.test in Chrome profile "Default"; then retry once/,
+    );
+    assert.deepEqual(
+      [out.write, out.retry, out.nextCall],
+      ["not_sent", "after_fix", { action: "sign_in_browser", profile: "Chrome/Default", site: "m", op: "post" }],
+    );
+
+    // signed in again there: the re-import brings the login back before the one send, and the
+    // refusals left no record for the duplicate guard to hold it back with
+    profile({ name: "auth_token", value: live });
+    const sent = await write();
+    assert.equal(sent.ok, true, JSON.stringify(sent));
+    assert.equal(seen.length, 1);
+  });
+
+  test("an auth answer is not retried on a re-import that brought back the same login cookie", async () => {
+    live = "token-live-0002";
+    profile({ name: "auth_token", value: "token-dead-0001" });
+    saveSession("m", { cookies: [token("token-dead-0001")], values: {}, source: "chrome:Default" });
+    const r = await call("m", "me", {}, opts(server));
+    assert.equal(r.class, "auth");
+    assert.equal(seen.length, 1, "the same request again would get the same answer");
+    assert.match(r.next ?? "", /ask the user to sign in to members\.test in Chrome profile "Default"; then retry once/);
+    assert.deepEqual(
+      [r.retry, r.nextCall],
+      ["after_fix", { action: "sign_in_browser", profile: "Chrome/Default", site: "m", op: "me" }],
+    );
+
+    // signed in again in that profile: a renewed cookie is worth the retry
+    seen = [];
+    profile({ name: "auth_token", value: live });
+    const ok = await call("m", "me", {}, opts(server));
+    assert.equal(ok.ok, true, JSON.stringify(ok));
+    assert.equal(seen.length, 2);
+  });
+});
+
+test("a write whose 200 body refuses it is not ok and is never sent again, a lost session included", async () => {
+  for (const [body, cls, step] of [
+    [{ data: { createPost: { post: null, userErrors: [{ message: "Title can't be blank" }] } } }, "error", "fix_args"],
+    [{ status: "error" }, "error", "fix_args"],
+    [{ error: "Message too long" }, "error", "fix_args"],
+    [{ error: "You are not logged in" }, "auth", "login"],
+  ] as const) {
+    seen = [];
+    const text = `refused ${JSON.stringify(body)}`;
+    const r = await call("t", "post", { text }, { ...opts(() => json(body)), allowWrites: true });
+    assert.equal(r.ok, false, JSON.stringify(r));
+    assert.equal(r.class, cls, JSON.stringify(r));
+    assert.match(r.reason ?? "", /refused the write/);
+    assert.equal(seen.length, 1, "a 200 is no proof it did not run: sent once");
+    // it did not run: fix what it says first, then it may be sent
+    assert.equal(r.write, "not_applied", JSON.stringify(r));
+    assert.equal(r.server, undefined, "the site answered: no server failure");
+    assert.equal(r.nextCall?.action, step, JSON.stringify(r));
+    assert.equal(r.retry, "after_fix", JSON.stringify(r));
+    if (cls === "error") assert.match(r.next ?? "", /refused the write, so it did not run/);
+  }
+});
+
+test("a write whose 200 may have partly run, or whose redirect lands back on its form with an error, may have applied", async () => {
+  const back = (url: string) =>
+    new URL(url).pathname === "/api/post"
+      ? new Response("", { status: 303, headers: { location: "https://t.test/compose?error=blank" } })
+      : new Response("<html><form></form></html>", { headers: { "content-type": "text/html" } });
+  for (const [what, h] of [
+    ["errors beside data", () => json({ data: { createPost: { id: 1 } }, errors: [{ message: "x" }] })],
+    ["a server failure in the body", () => json({ status: 503 })],
+    ["back on the form", back],
+  ] as const) {
+    seen = [];
+    const r = await call("t", "post", { text: what }, { ...opts(h), allowWrites: true });
+    assert.equal(r.ok, false, JSON.stringify(r));
+    assert.equal(r.write, "may_have_applied", `${what}: ${JSON.stringify(r)}`);
+    assert.equal(r.retry, "no", what);
+    assert.equal(r.nextCall?.action, "check_site", what);
+    assert.equal(seen.filter((s) => s.method === "POST").length, 1, what);
+    // a 5xx standing in the body is the server's own failure, as at the status line
+    assert.equal(r.server, what === "a server failure in the body" ? true : undefined, what);
+  }
+});
+
+test("a signed-in read redirected to a consent page is not drift: no heal, nothing stale, a hint to finish the page", async () => {
+  saveSite(
+    parseSite({
+      name: "consent",
+      baseUrl: "https://t.test",
+      operations: [
+        {
+          name: "me",
+          readOnly: true,
+          learnedLoggedIn: true,
+          request: { method: "GET", url: "https://t.test/api/me?v=alice", headers: {} },
+          slots: [{ param: "v", at: ["query:v"] }],
+          trigger: { url: "https://t.test/home?v={v}" },
+          params: [{ name: "v", example: "alice" }],
+          response: { extract: "data" },
+        },
+      ],
+    }),
+  );
+  const h: Handler = (url) =>
+    new URL(url).pathname === "/api/me"
+      ? new Response("", { status: 302, headers: { location: "https://t.test/privacy/consent?continue=%2Fapi%2Fme" } })
+      : new Response("<html><h1>We value your privacy</h1><button>Accept all</button></html>", {
+          headers: { "content-type": "text/html" },
+        });
+  const r = await call("consent", "me", { v: "bob" }, opts(h));
+  assert.equal(r.class, "error", JSON.stringify(r));
+  assert.match(r.reason ?? "", /t\.test\/privacy\/consent/);
+  assert.match(r.next ?? "", /https:\/\/t\.test\/privacy\/consent.*api-anything login consent/);
+  assert.equal(heals().length, 0);
+  assert.equal(staleMark("consent", "me"), undefined);
+  assert.equal(r.nextCall?.action, "login", JSON.stringify(r));
+  assert.equal(r.retry, "after_fix");
+  assert.equal(seen.filter((s) => s.url.includes("/api/")).length, 1, "no second try and no example args replay");
 });
 
 test("add --from a capture judges the op on the captured response: a wrong --extract is a warning, a right one a preview", async () => {
@@ -548,6 +755,7 @@ test("contract: class x read/write x sent says consistent write, retry and nextC
   const ACTIONS = new Set([
     "retry",
     "login",
+    "sign_in_browser",
     "heal",
     "relearn",
     "fix_args",
@@ -597,6 +805,20 @@ test("contract: class x read/write x sent says consistent write, retry and nextC
         if (c === "duplicate") assert.equal(r.retry, "no", row);
       }
   assert.ok(rows > 100, String(rows));
+
+  // an auth whose re-import brought back the same cookies: the user signs in again in that profile,
+  // unless a write may have run, which comes first
+  const signIn = { action: "sign_in_browser" as const, profile: "Chrome/Profile 1" };
+  for (const op of [read, write])
+    for (const [what, log] of sends.filter(([w]) => w !== "accepted")) {
+      const r = finish({ ok: false, class: "auth", nextCall: signIn }, op, "t", log);
+      const row = `${op.readOnly ? "read" : "write"} auth after ${what}: ${JSON.stringify(r)}`;
+      if (r.write === "may_have_applied") assert.deepEqual([r.nextCall?.action, r.retry], ["check_site", "no"], row);
+      else assert.deepEqual([r.nextCall, r.retry], [{ ...signIn, site: "t", op: op.name }, "after_fix"], row);
+    }
+  // a readback that found the write: the strongest status, kept as said, and nothing left to do
+  const applied = finish({ ok: true, class: "ok", write: "applied" }, write, "t", sends.at(-1)![1]);
+  assert.deepEqual([applied.write, applied.retry, applied.nextCall], ["applied", undefined, undefined]);
 });
 
 test("contract through call(): a read's rate limit and a write's three outcomes", async () => {
@@ -628,4 +850,233 @@ test("contract through call(): a read's rate limit and a write's three outcomes"
     w(() => json({})),
   );
   assert.deepEqual([unknown.class, unknown.write, unknown.nextCall?.action], ["input", "not_sent", "fix_args"]);
+});
+
+/** A read whose list pages by `after`, and a to-do write whose readback is a read of the same site. */
+const pagedAndTodos = (paging: Record<string, unknown>, readback?: Record<string, unknown>) =>
+  parseSite({
+    name: "t",
+    baseUrl: "https://t.test",
+    operations: [
+      {
+        name: "reviews",
+        readOnly: true,
+        request: { method: "GET", url: "https://t.test/api/reviews?after=", headers: {} },
+        slots: [{ param: "after", at: ["query:after"] }],
+        params: [{ name: "after", required: false }],
+        trigger: { url: "https://t.test/reviews" },
+        response: { extract: "data.edges", pick: ["id"] },
+        paging,
+      },
+      {
+        name: "todos",
+        readOnly: true,
+        request: { method: "GET", url: "https://t.test/api/todos", headers: {} },
+        trigger: { url: "https://t.test/todos" },
+        response: { extract: "todos" },
+      },
+      {
+        name: "add",
+        readOnly: false,
+        request: {
+          method: "POST",
+          url: "https://t.test/api/todos",
+          headers: { "content-type": "application/json" },
+          body: '{"title":"x"}',
+        },
+        slots: [{ param: "title", at: ["body", "json:/title"] }],
+        trigger: { url: "https://t.test/todos" },
+        params: [{ name: "title" }],
+        ...(readback ? { readback } : {}),
+      },
+    ],
+  });
+
+test("paging: a call returns the next page's cursor, read from the whole answer before extract and pick", async () => {
+  saveSite(pagedAndTodos({ param: "after", next: "data.pageInfo.next" }));
+  const page = (next: unknown) => () =>
+    json({ data: { edges: [{ id: 1, text: "a" }], pageInfo: next === undefined ? {} : { next } } });
+  const r = await call("t", "reviews", {}, opts(page("c2")));
+  assert.deepEqual([r.ok, r.data, r.nextPage, r.hasMore], [true, [{ id: 1 }], "c2", true]);
+  // the cursor goes where the param goes
+  const second = await call("t", "reviews", { after: "c2" }, opts(page(3)));
+  assert.equal(new URL(seen.at(-1)!.url).searchParams.get("after"), "c2");
+  assert.equal(second.nextPage, 3);
+  // the site says there is no next page
+  for (const end of [null, ""]) {
+    const last = await call("t", "reviews", { after: "c9" }, opts(page(end)));
+    assert.deepEqual([last.ok, last.nextPage, last.hasMore], [true, undefined, false], JSON.stringify(end));
+  }
+  // nothing at the path: unknown, so neither field is said
+  const silent = await call("t", "reviews", {}, opts(page(undefined)));
+  assert.deepEqual([silent.ok, "nextPage" in silent, "hasMore" in silent], [true, false, false]);
+
+  // learned from the request that loads page 2, the template holds page 2's cursor: left out, the
+  // cursor is cleared (empty, or null in JSON), never the captured one sent
+  const learned = pagedAndTodos({ param: "after", next: "data.pageInfo.next" });
+  learned.operations[0]!.request.url = "https://t.test/api/reviews?after=Y2Fw";
+  saveSite(learned);
+  await call("t", "reviews", {}, opts(page("c2")));
+  assert.equal(new URL(seen.at(-1)!.url).searchParams.get("after"), "");
+  const graphql = {
+    ...learned.operations[0]!,
+    request: {
+      method: "POST",
+      url: "https://t.test/graphql",
+      headers: {},
+      body: '{"pagination":{"after":"Y2Fw","limit":30}}',
+    },
+    slots: [{ param: "after", at: ["body", "json:/pagination/after"] }],
+  };
+  assert.equal(buildRequest(graphql, {}, NO_SESSION).body, '{"pagination":{"after":null,"limit":30}}');
+  assert.equal(buildRequest(graphql, { after: "c2" }, NO_SESSION).body, '{"pagination":{"after":"c2","limit":30}}');
+
+  // numbered pages: an answer says nothing about the next one, and page+1 is no evidence there is one
+  saveSite(pagedAndTodos({ param: "after" }));
+  const numbered = await call("t", "reviews", { after: "1" }, opts(page("c2")));
+  assert.deepEqual([numbered.ok, "nextPage" in numbered, "hasMore" in numbered], [true, false, false]);
+});
+
+test("paging: a page cut to fit the output cap says the cut items are not on the next page either", async () => {
+  saveSite(pagedAndTodos({ param: "after", next: "data.pageInfo.next" }));
+  const edges = Array.from({ length: 40 }, (_, i) => ({ id: `${i}-${"x".repeat(1000)}` }));
+  const r = await call(
+    "t",
+    "reviews",
+    {},
+    opts(() => json({ data: { edges, pageInfo: { next: "c2" } } })),
+  );
+  assert.equal(r.nextPage, "c2");
+  assert.match(r.truncated ?? "", /nextPage starts after the last item of this page, cut or not/);
+});
+
+test("readback: a write the read finds is applied, sent once; the ledger settles it, so a repeat is refused", async () => {
+  saveSite(pagedAndTodos({ param: "after" }, { op: "todos", find: { field: "title", equals: "{title}" } }));
+  const list: { title: string }[] = [];
+  const answer = (_url: string, init?: RequestInit) => {
+    if (init?.method === "POST") {
+      list.push(JSON.parse(String(init.body)));
+      return json({ ok: true });
+    }
+    return json({ todos: list });
+  };
+  const w = { ...opts(answer), allowWrites: true };
+  const r = await call("t", "add", { title: "milk" }, w);
+  assert.deepEqual([r.ok, r.class, r.write], [true, "ok", "applied"], JSON.stringify(r));
+  assert.match(r.reason ?? "", /read back with todos: found it/);
+  assert.deepEqual(
+    seen.map((s) => s.method),
+    ["POST", "GET"],
+  );
+  const ledger = JSON.parse(readFileSync(join(HOME, "writes.json"), "utf8"));
+  assert.equal(ledger.at(-1).status, "applied");
+  const dup = await call("t", "add", { title: "milk" }, w);
+  assert.deepEqual([dup.class, dup.write], ["duplicate", "not_sent"]);
+  assert.match(dup.reason ?? "", /read back/);
+  assert.equal(seen.length, 2, "not sent again");
+  // an idempotency key answers with the applied record
+  assert.equal((await call("t", "add", { title: "eggs" }, { ...w, idempotencyKey: "k1" })).write, "applied");
+  const replay = await call("t", "add", { title: "eggs" }, { ...w, idempotencyKey: "k1" });
+  assert.deepEqual([replay.ok, replay.write], [true, "applied"]);
+  assert.equal(seen.filter((s) => s.method === "POST").length, 2);
+});
+
+test("readback: not found, or a read that fails, changes nothing; a write that may have run and is found is applied", async () => {
+  saveSite(pagedAndTodos({ param: "after" }, { op: "todos", find: { field: "title", equals: "{title}" } }));
+  const w = (h: Handler) => ({ ...opts(h), allowWrites: true, again: true });
+  const notYet = await call(
+    "t",
+    "add",
+    { title: "milk" },
+    w((_u, i) => (i?.method === "POST" ? json({ ok: true }) : json({ todos: [{ title: "bread" }] }))),
+  );
+  assert.deepEqual([notYet.ok, notYet.write], [true, "accepted"]);
+  assert.match(notYet.reason ?? "", /read back with todos: not found.*may not show it yet/);
+
+  const readFails = await call(
+    "t",
+    "add",
+    { title: "milk" },
+    w((_u, i) => (i?.method === "POST" ? json({ ok: true }) : json({}, 500))),
+  );
+  assert.deepEqual([readFails.ok, readFails.write], [true, "accepted"]);
+  assert.match(readFails.reason ?? "", /could not read it back with todos/);
+
+  // the write's answer was lost, but the list shows it: it ran
+  const lost = await call(
+    "t",
+    "add",
+    { title: "milk" },
+    w((_u, i) => (i?.method === "POST" ? json({ error: "boom" }, 502) : json({ todos: [{ title: "milk" }] }))),
+  );
+  assert.deepEqual(
+    [lost.ok, lost.class, lost.write, lost.retry, lost.nextCall],
+    [true, "ok", "applied", undefined, undefined],
+  );
+  assert.match(lost.reason ?? "", /502.*read back with todos: found it/);
+  // a lost answer and nothing in the list: still may_have_applied, still never sent again
+  const unknown = await call(
+    "t",
+    "add",
+    { title: "milk" },
+    w((_u, i) => (i?.method === "POST" ? json({ error: "boom" }, 502) : json({ todos: [] }))),
+  );
+  assert.deepEqual([unknown.ok, unknown.write, unknown.retry], [false, "may_have_applied", "no"]);
+
+  // a write that did not run, or was not sent, is not read back
+  seen = [];
+  const refused = await call(
+    "t",
+    "add",
+    { title: "milk" },
+    w(() => json({ error: "no" }, 403)),
+  );
+  assert.equal(refused.write, "not_applied");
+  assert.deepEqual(
+    seen.map((s) => s.method),
+    ["POST"],
+  );
+  // a 200 whose body refuses the write (rejected): it did not run, so there is nothing to read back
+  seen = [];
+  const rejected = await call(
+    "t",
+    "add",
+    { title: "milk" },
+    w((_u, i) =>
+      i?.method === "POST" ? json({ ok: false, error: "title taken" }) : json({ todos: [{ title: "milk" }] }),
+    ),
+  );
+  assert.deepEqual([rejected.ok, rejected.write], [false, "not_applied"], JSON.stringify(rejected));
+  assert.deepEqual(
+    seen.map((s) => s.method),
+    ["POST"],
+  );
+  seen = [];
+  await call(
+    "t",
+    "add",
+    { title: "milk" },
+    opts(() => json({})),
+  );
+  assert.equal(seen.length, 0);
+});
+
+test("readback: with no find, any data counts; read args take the write's values", async () => {
+  saveSite(pagedAndTodos({ param: "after" }, { op: "reviews", args: { after: "{title}" } }));
+  const w = (h: Handler) => ({ ...opts(h), allowWrites: true, again: true });
+  const r = await call(
+    "t",
+    "add",
+    { title: "c7" },
+    w((_u, i) => (i?.method === "POST" ? json({ ok: true }) : json({ data: { edges: [{ id: 7 }] } }))),
+  );
+  assert.equal(r.write, "applied");
+  assert.equal(new URL(seen.at(-1)!.url).searchParams.get("after"), "c7");
+  const empty = await call(
+    "t",
+    "add",
+    { title: "c8" },
+    w((_u, i) => (i?.method === "POST" ? json({ ok: true }) : json({ data: { edges: [] } }))),
+  );
+  assert.equal(empty.write, "accepted");
 });

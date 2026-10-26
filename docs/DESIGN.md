@@ -310,8 +310,10 @@ Input: the captured exchanges plus one or two example arg sets. Output: an Opera
    site-global: a globally promoted x-twitter-auth-type broke every X guest read. At call time a
    filled header whose value holds a line break or a NUL is not sent: the call fails naming the
    header, never the value (fetch's own error would quote a session's token into the result).
-7. Record `learnedLoggedIn` (whether the session had auth cookies). If an op learned signed in comes
-   back without its data and the jar has no login cookie, the call is `auth`, not drift.
+7. Record `learnedLoggedIn` (whether the session had auth cookies, not counting the names a signed-out
+   visit is given: "Guest cookies" under Logging in). If an op learned signed in comes back without its
+   data and the jar has no login cookie, the call is `auth`, not drift; a write learned signed in is
+   not sent at all while the jar has none ("Before a write" under Logging in).
 8. **Response.** Store the content type, the XSSI prefix to strip (`)]}'`), a suggested `extract` path (the
    richest array/object carrying the example value), and an inferred **shape** (key paths + types)
    for drift detection. The agent may set `pick` (fields per item) for token efficiency.
@@ -324,7 +326,9 @@ Input: the captured exchanges plus one or two example arg sets. Output: an Opera
    a number). `add --enum name=a,b --min name=n --max name=n` sets the last three, and editing the spec
    sets any of them. A call whose arg fails one is `input` before anything is sent, and the examples
    must fit them at add. An op learned again keeps them, and the param's description, for params of
-   the same name, and keeps its `checks` whose args are all still params.
+   the same name, and keeps its `checks` whose args are all still params. It also keeps its `paging`
+   (Response extraction), which `add --paging` sets, and a write keeps its `readback` (Writes), as
+   long as the shared rules still pass for them.
 
 ## Writes
 
@@ -390,12 +394,44 @@ request. A read's tier-3 trigger also aborts unsafe requests other than the op's
 run, so a spec that says "read" can't write. While the page is a bot challenge's interstitial the
 steps are not running yet: its own verify POSTs (AWS WAF's `mp_verify`, Cloudflare's
 `/cdn-cgi/challenge-platform`) go through, or it would never reload; the guard applies from the real
-document on. Any 2xx to a write is `ok`, whatever the body (204,
-"OK", an HTML page with a password field), because the server took it, with one exception: a
-sign-in form (a password field next to a username field, or a form posting to a login path) where
-the op's answer is not a page is `auth`: the session was gone and nothing ran. An explicit JSON `ok: false` or `success: false` rejects a write even with HTTP 200.
-A write executes exactly
-once per call. Retry only on a definite non-execution (400/401/403/404 answered to the request
+document on. A 2xx to a write is `ok` (204, "OK", an HTML page with a password field, `{"status":
+"queued"}`), because the server took it, unless the answer says it was not done:
+- A sign-in form (a password field next to a username field, or a form posting to a login path)
+  where the op's answer is not a page is `auth`: the session was gone and nothing ran.
+- A JSON answer that says the service refused the write is not `ok`, and is marked `rejected`.
+  That covers an error field that holds an error, up to four levels down (`error`, `errors` and
+  `userErrors` at any of those levels, and the family `validationErrors`, `errorMessage`, `hasError`
+  up to two). It covers `ok` or `success` false up to two levels, and a root `status`, `state`,
+  `result` or `outcome` that is an error word (`"error"`, `"fail"`, `"invalid"`). An error field
+  that is empty, zero, false or a word for none (`error: null`, `userErrors: []`) is no refusal. A
+  `message` is not read for error words, since a success can name what the write was about ("Error
+  report sent").
+- A numeric `status` of 400 or more, up to one level down, is judged as that HTTP status, like an
+  error status in place of the data (below). A 4xx there is a refusal; a 5xx is a server failure
+  and stays as ambiguous as one.
+- GraphQL errors with no `data` are a request error, so by the spec nothing ran. Errors with null
+  `data`, or with null under every root field, are an execution that failed. Both are refusals.
+  Errors next to a payload that is there mean the write may have partly run: not `ok`, and not
+  `rejected` either.
+- The class follows the wording: a refusal that says the session is gone is `auth`, one that names a
+  limit is `rate`, and anything else is `error`. Its `nextCall` follows: `fix_args` for `error`,
+  `login` for `auth`, `retry` after the wait for `rate`.
+- A form page that shows its errors (Django's `errorlist`, Rails' `field_with_errors` or
+  `#error_explanation`, or an alert whose text is an error's) is a refusal when it is the answer
+  itself, with no redirect. An element the markup hides (`hidden`, `aria-hidden`, an inline
+  `display: none`, a `<template>`) is not shown; a stylesheet's hiding is not seen.
+- After a redirect, neither of these proves anything: the post may have run before the redirect.
+  A redirect whose address names an error (`?error=title_blank`, `#status=failed`), or one back to
+  the op's own form page (its trigger's address) showing an error, is `error` with "may or may not
+  have run". It is not `rejected`.
+- A 201 with a `Location` header is a created resource, whatever its body names.
+
+None of this resends anything: a 2xx is never proof that a write did not run, so the rule below
+holds. Reads get none of it. A read's data can carry an error field of its own (a job's or a
+payment's failure), and a read without its data already goes through the example-args check
+below, which can tell a template that went stale (heal it) from bad args.
+
+A write executes exactly once per call. Retry only on a definite non-execution (400/401/403/404 answered to the request
 itself: after a redirect, as in Post/Redirect/Get, it ran; at tier 3 the page sent it, and the
 answer judged may be a redirect's follow-up, so a tier-3 write is never retried); timeouts, 5xx and network errors are
 ambiguous and are never retried. A redirect does not send it a second time either: at tiers 1 and 2
@@ -442,20 +478,41 @@ server flag, library option).
 
 What a write did is a field, not prose: `write` is read from every attempt the call made, the most
 any of them may have done. `not_sent`: nothing left (refused, bad args, a request that cannot be
-built, the browser profile busy, a tier-2 origin page that did not load, a tier-3 run that fired
+built, the browser profile busy, a tier-2 origin page that did not load or never sent the request, a tier-3 run that fired
 nothing after its confirm was told no, or the ledger below held it back). `not_applied`: the site answered that it did not run it (a definite non-execution as above,
 or an attempt flagged `rejected`: a clear refusal in a 2xx body, which the classifier sets).
 `accepted`: a 2xx judged ok, which proves the site took it and not that it took effect.
-`may_have_applied`: anything else that may have reached the site. A failed write that is `accepted`
-or `may_have_applied` always says `retry: "no"` and `nextCall: check_site`.
+`may_have_applied`: anything else that may have reached the site. `applied`: the op's readback
+(below) found it. A failed write that is `accepted` or `may_have_applied` always says `retry: "no"`
+and `nextCall: check_site`.
+
+Writes are aborted while they are learned, so learning never sees a write's success answer, and a
+2xx is the only evidence a call has. A write op can carry `readback: {op, args, find?}`, a read of
+the same site that proves it landed: after a call whose write is `accepted` or `may_have_applied`,
+that read runs once through `call` (healing and tiers as any read, `allowWrites` off). It is a read,
+never a resend, so send-once holds. Each arg and `find.equals` may hold `{param}`, filled from the
+write's args. With `find: {field, equals}`, some item of the read's result (or the result itself,
+when it is not a list) must have `field` equal to `equals`, compared as text with the ends trimmed.
+Without `find`, any data counts, which proves something only when a read arg comes from the write
+(a lookup by the id the caller chose). Found, the call becomes `ok`, class `ok`, `write: "applied"`,
+with no `retry` or `nextCall`, even after a lost answer (a timeout, a 502): the site shows the write.
+Not found, or a read that fails, changes nothing but `reason`, which says the site may not show it
+yet: it stays `accepted` or `may_have_applied`, and the second is still never sent again.
+Pomerado saves again when its read-back does not match (`typescript/authoring/writes/SKILL.md`);
+that is a second send, so here a miss only leaves the status as it was. The readback has to find
+something only this write makes (a title the caller chose, an id it returns elsewhere), or an older
+item with the same value passes for it. `api-anything readback <site> <write> <read> [k=v ...]
+[--find field=value]` sets it, checked by the shared rules below. An op learned again keeps its
+readback while those rules still pass.
 
 An agent that skims an unclear answer sends the write again, so a write is recorded before it is
 sent (`writes.json` in `~/.api-anything`, under its lock, written atomically): site, op, time, a
 status (`sending` until the call settles it) and an HMAC-SHA256 of `[site, op, args]` (defaults
 filled, keys sorted) under a random key made on first use (`write.key`, 0600), so a short arg (a
 comment, a vote) cannot be guessed back from the file. The args are never stored. The same digest
-within 10 minutes of a record that is `accepted`, `may_have_applied` or still `sending` (its process
-died mid-send) is refused with class `duplicate`, `write: "not_sent"`, and a `next` to check the site.
+within 10 minutes of a record that is `accepted`, `applied`, `may_have_applied` or still `sending`
+(its process died mid-send) is refused with class `duplicate`, `write: "not_sent"`, and a `next` to
+check the site.
 Ten minutes covers an agent's re-send after an unclear answer, a login or a heal in between, and the
 user looking at the site; a repeat placed on purpose later (the same comment an hour on) goes
 through. `again` (CLI `--again`, MCP `again`, library option) skips the check, for a user who
@@ -473,13 +530,13 @@ Every response is classified, never by status code alone:
 
 | class | signals | action |
 |---|---|---|
-| `ok` | 2xx, expected content type, extract path present (an empty list there is a search with no results: `data: []`; for an html recipe whose items selector is `<container> <item>`, the container present with no element of the item's tag), no GraphQL `errors` with null `data` or next to a null extract target, no error status in place of the data; any 2xx to a write that carries no error status | return |
-| `drift` | 404/410 on a templated API path, GraphQL "PersistedQueryNotFound"/"must be defined", 400 schema errors, extract path missing, breaking shape change (compared under the extract path; id-keyed maps are `*`) | heal once |
+| `ok` | 2xx, expected content type, extract path present (an empty list there is a search with no results: `data: []`; for an html recipe whose items selector is `<container> <item>`, the container present with no element of the item's tag), no GraphQL `errors` with null `data` or next to a null extract target, no error status in place of the data; any 2xx to a write whose answer does not say it was refused (see Writes) | return |
+| `drift` | 404/410 on a templated API path, GraphQL "PersistedQueryNotFound"/"must be defined", 400 schema errors, extract path missing, a non-empty list there that the `pick` empties (no item has a picked field: a shared spec has no learned shape, and `data: []` would read as no results), an html recipe whose items all match with none of their fields found, breaking shape change (compared under the extract path; id-keyed maps are `*`) | heal once (missing data first checks the example args) |
 | `auth` | 401, 400/403/422 with login wording ("Bad Authentication data") or a refused API key ("Invalid Application-ID or API key") or an explicit CSRF failure (token missing/invalid/mismatch, verification failed, InvalidAuthenticityToken; not a page that merely carries a csrf field), a 403 login page, 419, 200 + HTML login page where JSON expected, a sign-in form that embeds a CAPTCHA widget or a vendor script that also rides on ordinary pages (reCAPTCHA on a login page guards the login; an interstitial's own markers still make the page `blocked`), an html/embedded op's page without its data that says "sign in" or shows a sign-in form (a mere Sign-in link, like Google's ServiceLogin button, is not one), a redirect to a login path, `require_login: true`, a trigger that lands on a sign-in page | each step at most once per call, at any tier, a retry that still answers `auth` going on to the next step (a changed analytics cookie changes the request without renewing a token); a write only when it certainly did not run, so never at tier 3: re-import a browser-imported session; then refresh the jar's cookies from the profile, retrying if that changes the request (a tier-2 page sends the profile's cookies itself, so there only a `cookie:` ref counts: an `x-csrf-token` header); for a read with `session:` refs, one trigger run refreshes them and answers; for a write with them, one trigger run with the write intercepted (as when learning it) refreshes them and the write is sent again; for a read whose only credential is one marked public, with no login on record, a heal re-learns it, as for drift (the site rotated its shared bearer); then diagnostic "run `api-anything login <site>`" |
 | `rate` | 429 (with the server's Retry-After), "please wait", "rate limit" | back off, report; no heal |
-| `blocked` | challenge pages (Cloudflare, Akamai, DataDome, PerimeterX, AWS WAF, Amazon, Imperva, Kasada, self-solving JS challenges, reCAPTCHA; an interstitial's title even on a big page, unless the op's html/embedded recipe finds its data there: "Robot check-in: how our robots work"), even at 200. The interstitial's own structure counts at any status; a vendor script that also rides on ordinary pages (AWS WAF's challenge.js, DataDome's tags.js, Imperva's resource script, Kasada's ips.js and `x-kpsdk-*` headers) counts only on a challenge status (202, 403, 405, 429, 503); a bare 403 with no markers. A page showing a sign-in form is `auth`, not a wall, when its only challenge marker is one that also rides on ordinary pages (a CAPTCHA widget, a vendor script or header on a challenge status); an interstitial's own structure or title on that page is still a wall | escalate transport tier; then diagnostic `gated`. A read's bare 403 first replays the example args once at the same tier: if they answer, the call is `input` (a private or missing entity), with no climb and no heal |
+| `blocked` | challenge pages (Cloudflare, Akamai, DataDome, PerimeterX, AWS WAF, Amazon, Imperva, Kasada, self-solving JS challenges, reCAPTCHA; an interstitial's title even on a big page, unless the op's html/embedded recipe finds its data there: "Robot check-in: how our robots work"), even at 200. The interstitial's own structure counts at any status; a vendor script that also rides on ordinary pages (AWS WAF's challenge.js, DataDome's tags.js, Imperva's resource script, Kasada's ips.js and `x-kpsdk-*` headers) counts only on a challenge status (202, 403, 405, 429, 503); a bare 403 with no markers. A page showing a sign-in form is `auth`, not a wall, when its only challenge marker is one that also rides on ordinary pages (a CAPTCHA widget, a vendor script or header on a challenge status); an interstitial's own structure or title on that page is still a wall; a tier-3 run or a heal's recapture whose trigger fired no matching request and ended on a challenge that did not solve (judged before a sign-in page or a page that is down) | escalate transport tier; then diagnostic `gated`. A read's bare 403 first replays the example args once at the same tier: if they answer, the call is `input` (a private or missing entity), with no climb and no heal |
 | `input` | 400 with validation error mentioning a param; 404 with the param in the path; a read's 404, empty 2xx or missing data while the example args still answer; a GraphQL not-found; an unknown arg name | return the error to the caller |
-| `error` | anything else (a network error names its cause) | return with details |
+| `error` | a write refused in its 2xx answer (see Writes); a signed-in JSON read (it holds a credential ref, or was learned signed in) redirected off its path to an HTML page of the same site with no sign-in form or challenge: a consent, terms or "verify it's you" step, reported with its address and a `next` to finish it in the browser and run `api-anything login <site>` (`nextCall` `login`) (a real redirect only: an SPA's shell at the request's own address is drift); anything else (a network error names its cause) | return with details; no heal, nothing stale |
 
 An error status a 2xx answer carries in place of its data is judged as the HTTP status it stands
 for: a batchexecute RPC whose payload's place holds `[13]` (`[["wrb.fr",null,null,null,null,[13]]]`),
@@ -514,9 +571,10 @@ drifted (a renamed field): `drift`, with a hint to re-add with a new `--extract`
 Two guards against heal loops. A heal that produces a byte-identical template (compared with the
 same args filled in) is not drift. An op healed less than 10 minutes ago that fails again, or
 whose heal failed, is marked stale for 30 minutes with a reason, not re-healed. While stale, a read
-still tries its trigger (tier 3), unless the trigger did not answer either. A heal that learned
-nothing about the op (its check was rate limited, challenged or logged out, or another process held
-the browser profile, or no browser is installed for the recapture) stops at once and marks nothing
+still tries its trigger (tier 3), unless the trigger did not answer either (a run met by a challenge,
+a limit or a sign-in page is no such answer). A heal that learned nothing about the op (its check
+was rate limited, challenged or logged out, its recapture ended on a challenge that did not solve,
+another process held the browser profile, or no browser is installed for the recapture) stops at once and marks nothing
 stale. A forced `api-anything heal` that re-learns the same template replays it once and reports its
 answer: the same template is no proof the op works.
 
@@ -612,9 +670,19 @@ At tier 2 `timeoutMs` is one deadline for the whole call, counted from the momen
 (starting it, seconds on a busy machine, is not counted): the first load of the origin page, every
 hop of the fetch, and the wait and second fetch after the page navigated all draw on it. When the
 origin's root redirects to another origin, it fetches from a
-blank stand-in page on the request's origin. When the origin page navigates mid-fetch (its own
+blank stand-in page on the request's origin. When the origin page navigates mid-fetch, after the request left (its own
 challenge or redirect destroys the context), a read waits for the new document and fetches once
-more; a write is never resent. The tier-3 answer is the matching request whose declared parameter positions equal the
+more; a write is never resent.
+Origin pages are kept per origin across a process's calls, and every request one sends waits in
+the browser until api-anything lets it go. A fetch none of whose requests was let go within 2 s
+(any with its method to its origin counts, the page's own included) never left: seen on a loaded
+machine, a cached page whose renderer ran nothing until the next DevTools command reached it, so
+the call waited out its whole deadline. A page that closed or navigated before letting one go is
+treated the same. That page is retired, whatever it sends later is failed in
+the browser, and the request goes once more from a fresh page inside the same deadline, a write
+too, since nothing was sent. If that one never leaves either, the call fails with
+`write: "not_sent"` (when it was the first hop). A page a call failed on is not handed to the next
+call. The tier-3 answer is the matching request whose declared parameter positions equal the
 materialized call, including short and structured values, and whose response judges ok (a `softFrom` page fires its own; a WAF interstitial precedes the page).
 A param's default is filled into the args once, before the first tier, so every tier runs with the
 same values: the tier-3 trigger opens `?count=20`, never a literal `{count}`.
@@ -715,6 +783,28 @@ the page. For data embedded in the HTML document (for example Google's `AF_initD
 "embedded"` with a regex whose capture group is JSON, followed by `extract`. Seroval/JS-literal
 payloads are out of scope for v1.
 
+A read whose list pages carries `paging: {param, next?}`. `param` is the arg that asks for the
+next page. `next` is a path in the whole answer, read before `extract` and `pick` throw the rest
+away (for `embedded`, in the embedded JSON; never for `html`), to the next page's cursor or number.
+A call returns that value as `nextPage`, with `hasMore: true`. When the answer has `null`, `""` or
+`false` there, the site says this is the last page: `hasMore: false` and no `nextPage`. When the
+path finds nothing, neither field is set, because a moved path must not read as the last page.
+Without `next` the pages are numbered, and a call says nothing about the next one. `nextPage =
+page + 1` while the list is non-empty would be a guess: the last page is non-empty too, and many
+sites answer a page past the end with the last page again, so an agent paging by it might never
+stop. The agent sets the param itself, and `verify` checks that page n+1 is not page n.
+
+A cursor op is learned from the request that loads page 2 ("Show more"), since page 1's request
+often has no cursor field. `add --paging <param>=<path>` makes that param optional and drops its
+example, since a captured cursor can expire or carry the session it was made for. A call that
+leaves the cursor out gets the first page: the slot is emptied (`null` in a JSON leaf, `""`
+elsewhere), so the template's captured page-2 cursor is never sent. Calls are stateless replays,
+so the cursor is the site's own value, passed through untouched. It is not signed or re-windowed
+as Pomerado's list cursors are (`docs/how-it-works.md`): there is no server state for a cursor to
+point into. When the output cap cuts a page, `truncated` says that `nextPage` starts after the
+page's last item, cut or not. The cut items are on neither page, so a smaller page size (a
+`limit` param) is the fix.
+
 ## Spec files and where they live
 
 One JSON file per site: `{ name, displayName, baseUrl, description, operations[] }`, zod-validated.
@@ -794,10 +884,24 @@ regexes (`pick` `~`, `embedded`, param `pattern`) at most 200 characters with no
 inside a quantified group; at most 50 operations, descriptions and hints at most 500 characters,
 notes at most 8 KB, the file at most 256 KB; a param's `enum` at most 100 values of at most 500
 characters each; at most 10 checks per op, each arg a param of the op and at most 500 characters, a
-purpose at most 500; no checks on a write (verify would send it); no `unproven` mark. Warnings, shown to the human and put in the pull
+purpose at most 500; no checks on a write (verify would send it); no `unproven` mark; no provider key
+anywhere in the spec or the notes, by the key's own prefix (`providerKeys`): GitHub (`ghp_`, `gho_`,
+`ghu_`, `ghs_`, `ghr_`, `github_pat_`), OpenAI and Anthropic (`sk-`, `sk-proj-`, `sk-ant-`, with a
+random run so a slug like `sk-hynix-ddr5-...` is no key), AWS access key ids (`AKIA`/`ASIA` and 16
+more), Slack (`xox[abposr]-`) and `-----BEGIN ... PRIVATE KEY-----`, raw or percent-encoded. A
+provider issues each to one account and no site ships one to every visitor, so `public` waives none;
+the error names the key by its first 8 characters only; `paging` only
+on a read, its param one of the op's that goes into a slot (and optional when `next` names a cursor,
+since the first page leaves it out), its `next` a path to one value (no `[*]`, at most 200
+characters) on a JSON or embedded answer; a `readback` only on a write, naming a read of the same
+spec, setting only that read's params and every required one, filling `{name}` only from the
+write's params and from at least one of them (otherwise any answer would pass for this write), each
+value at most 500 characters. Warnings, shown to the human and put in the pull
 request for the reviewer: reads sent as POST, writes, ops learned logged in, literal `public` values
 (a shared bearer makes every user's calls that account's), requests or triggers off the spec's own
-site (Algolia behind Hacker News, AppSync behind Goodreads), and the export scan's shape heuristics.
+site (Algolia behind Hacker News, AppSync behind Goodreads), the export scan's shape heuristics over
+the spec and the notes, and a Google API key (`AIza` and 35 more), which a site's own pages often
+carry for anyone to read (Maps, Firebase, YouTube), so it is a question for the reviewer, not a refusal.
 
 **What the rules do not cover, so review does.** A read sent as GET or as a non-GraphQL POST can
 still change something; trigger steps can click what the page lets them before `readGuard` acts on
@@ -852,7 +956,14 @@ does, and judges every case: `pass`, `fail`, or `inconclusive` when the answer i
 about the op. Its outcomes are kept per op in `~/.api-anything/checks/<site>.json`, with a hash of
 the op as it was after the run (a heal during verify included; `learnedAt` and `unproven` aside),
 so an op changed since has no record. When two passing cases whose args differ only in an op's
-`unproven` params answer differently, verify clears the mark. `publish` refuses an op marked
+`unproven` params answer differently, verify clears the mark. A read with `paging` gets one more
+case after its example, `next page`: the call again with the paging param set to the example's
+`nextPage` (or, for numbered pages, the example's page number plus one). It fails when the answer
+has rows and every one of them was on page 1 (`got: "page 1 again"`), the sign of a server that
+ignores the param where the request puts it. One new row is enough to pass (Pomerado's rule,
+`typescript/src/mint/live-tests.ts`). It is inconclusive when there is no page 1 to go on from (the
+example failed or was empty), no next page to ask for (no cursor in page 1's answer, or no page
+number in the example), or an empty page 2, which some lists end with. `publish` refuses an op marked
 `unproven`, an op with checks and no record for its current version, and any counted case that
 failed: every counted case must pass, with no percentage bar, because there are two or three
 human-confirmed cases, not a suite in which one wrong case should be outvoted. Inconclusive cases
@@ -895,6 +1006,24 @@ site with the CLI or a login window, and session values stay bound to their host
 trust as a human's pull, since the registry's specs are reviewed (see Trust model), and the same rules
 run on it on every load.
 
+**Recorded answers (`test/fixture/sites/<site>.json`).** CI cannot reach the sites, so for every
+bundled op it can, it keeps an answer trimmed to what the recipe reads: `{op, args, status,
+contentType, note, body}`, the body as text or as JSON. One test in `test/sites.test.ts` checks
+each one: `buildRequest` puts every arg in its slot (or a hole of another slot's template), and
+`judge` answers `ok` with every field the op returns present in some item. A fixture proves the
+recipe still parses that body, not that the site still answers that way. The files live under
+`test/`, not `sites/`. `listSites` would read a `sites/*.json` as a spec, `pull` and `publish`
+would have to carry them, and the npm package ships `sites/`. More to the point, a recorded answer
+is a page as the recorder's browser saw it (their location, their language, their session), which
+a maintainer trims by hand. `publish` never gathers one. The test refuses a fixture for an op
+learned signed in or one that sends a cookie or session value, a body over 8 KB, and anything the
+publish scans flag: `scanSecrets`'s token shapes (a JWT, a bearer, a long hex or base64 blob) and
+`personalIn`'s email addresses, UUIDs and IP addresses, in the args and in the body. Trimming
+rebuilds HTML from the elements each field selector matches, never whole rows, so a form's
+per-visitor token does not ride along. JSON keeps a few items (with a learned `shape`, their keys
+too, or the classifier calls it drift). Where a site test already built a body from a real answer
+(YouTube's ad layout, Google Flights' results), that body is the fixture.
+
 **Nudges, not automation.** Once `verify <site>` passes for a site the user learned, its output
 says it can be shared (`next: api-anything publish <site>`). The skill tells the agent to `search`
 before `capture`.
@@ -918,8 +1047,24 @@ and no 2FA/captcha to redo — the human solved those in their own browser alrea
   SHA-256 of `host_key`, which is stripped. `expires_utc` is microseconds since 1601.
 - **Firefox**: `cookies.sqlite` `moz_cookies` is plaintext on every OS.
 - **Windows chromium** uses app-bound encryption and is not supported: `login` falls back to the window.
+- **Guest cookies**: a framework hands every visitor a session cookie named like a login
+  (`laravel_session`, a Rails `_app_session`, `ci_session`, `_gh_sess`), so a name proves nothing by
+  itself: a sign-in marker counts only if a signed-out visitor does not get it too. Every `login`
+  first GETs the target URL with no cookies, following up to five redirects within the site, and the
+  names of the cookies it is given join the session file's `guestCookies` (names only, a union kept
+  across logins) when that login saves its cookies; a login that fails leaves the file as it was. A
+  site whose spec pins `loginCookies` is not probed, since those names decide alone. Guest names are
+  not login evidence anywhere: `loggedIn`, profile choice, the window
+  check, and `learnedLoggedIn` at add and heal. A pinned `loginCookies` still decides on its own, and
+  `logged_in=yes` still counts by its value. A plain fetch sees only `Set-Cookie`, never a cookie page
+  script sets, but the cookies frameworks give every visitor are the server's, and a signed-out browser
+  visit would cost a launch and a profile of its own. A probe that gets no answer records nothing, and
+  a site never logged in has no list: the name heuristic decides there, as before. Two checks leave the
+  list out on purpose, because they compare the jar with an op's `learnedLoggedIn`, which may have been
+  learned with a guest name as its only login, before the list existed or on someone else's machine:
+  the pre-write check below and the drift check for an op learned signed in.
 - **Profile choice**: scan every profile of every installed browser for the site's `loginCookies`
-  (for an unknown site, auth-looking cookie names, else any cookie for the site). One profile holds
+  (for an unknown site, auth-looking cookie names that are not guest names, else any cookie for the site). One profile holds
   them: it is used. Several do (a work and a personal profile, or another person's account in the
   same Chrome): never a guess. `login` answers `ok: false` with each candidate's profile, display name
   and Google account email (from Chrome's `Local State` `profile.info_cache`) and a `next` of
@@ -932,14 +1077,48 @@ and no 2FA/captcha to redo — the human solved those in their own browser alrea
 - Imported cookies go into the jar **and** into api-anything's own browser profile (`addCookies`), so
   tier 2/3 and heals are logged in too.
 - `--window` opens a visible browser window on api-anything's profile for a by-hand sign-in (an
-  independent session). It is also the automatic fallback when nothing is importable.
+  independent session). It is also the automatic fallback when nothing is importable. The site's
+  cookies are read as the window opens, before its page loads, and then while it is open: on every
+  response (where a `Set-Cookie` lands) and every half second (for one a script sets), and once more
+  on Enter. Of the reads that completed while it was open, the newest started is kept; one still in
+  flight when it began closing never counts, nor does any read after. Closing Chrome's last window on
+  Linux or Windows quits it, and a quitting Chrome's jar has already lost its session cookies, often
+  the login among them (CI caught this). The sign-in counts
+  only when a login cookie (not a guest name) appeared or changed in between: a profile that already
+  held one proves nothing, since it may be the very cookie the site has signed out. Then the jar is
+  replaced and `login` answers `ok: true` with the `renewed` names. Otherwise it answers `ok: false`
+  with why (no login cookie appeared, or the ones held at opening did not change) and keeps the stored
+  session. The window does not close itself when a login cookie appears: a site can set its session
+  cookie before a second factor, a consent page or the redirect back from an identity provider is done,
+  and closing then would keep a half-finished sign-in. The human closes it, or presses Enter. Its
+  dialogs (popups included) are answered for it, since Playwright takes them from the human: a
+  `beforeunload` and an alert are accepted, so leaving or closing a page is never refused, and a
+  confirm or prompt is declined, as Playwright's default would. A site
+  whose only login cookie is one every visitor gets cannot be told apart by name: list that name in the
+  spec's `loginCookies`, and a change in it counts.
 - `--cookies <file>` imports a `cookies.txt` (Netscape) or JSON array (Cookie-Editor / Playwright)
   export, for servers/CI with no browser.
 - **Self-healing auth**: when a call classifies `auth` and the session came from a browser import,
   exactly the recorded profile is silently re-imported once (browserless) and the call retried (a write
-  only when it certainly did not run, so never one the page sent at tier 3); only if it is
-  still `auth` does the result carry the "run `api-anything login`" hint. This runs at tiers 2 and 3 as at
+  only when it certainly did not run, so never one the page sent at tier 3). The retry happens only
+  when the re-import renewed something: login cookies the jar did not hold, or held with other values.
+  For a site where neither side holds a cookie any rule names as a login, any changed cookie counts. The
+  same dead cookies again would only get the same answer, and `api-anything login` would import them
+  once more, so a call still `auth` after a re-import from a browser profile says where to sign in
+  instead: `ask the user to sign in to linkedin.com in Chrome profile "Work" (me@example.com); then
+  retry once`, with `nextCall` `{action: "sign_in_browser", profile: "Chrome/Profile 1"}` and `retry`
+  `after_fix`. Other sources keep the "run `api-anything login`" hint. This runs at tiers 2 and 3 as at
   tier 1: the import also lands in the browser profile those tiers send their cookies from.
+- **Import results**: `login` by import reports `loggedIn` (guest names aside) and `renewed`, and a
+  `warning` when the imported cookies show no sign-in ("Chrome profile "Work" looks signed out") or are
+  the login cookies the session already held, so nothing was renewed and a call that said `auth` will
+  say it again. It still answers `ok: true`: the cookies were imported and saved.
+- **Before a write**: a write learned signed in whose jar holds no live login cookie (expired, or never
+  there) is not sent as it stands. The recorded browser profile is re-imported first; if there is still
+  none, the call answers `auth` with `write: "not_sent"`, and the reason says so. It comes before the
+  duplicate guard records the write, so a call that sends nothing leaves nothing for a repeat to be
+  held back by. Nothing sent means the send-once rule is untouched. This check ignores `guestCookies` (see above), so a guest's write still
+  reaches the server, whose 401 or 403 is retried as any write's is.
 - **`logout <site>`** clears the jar and that site's cookies in the profile.
 
 `node:sqlite` is chosen over the `sqlite3` CLI: it is built in (no dependency, present on every
@@ -961,7 +1140,7 @@ independent alternative.
     form. Any other page that shows a sign-in form (a public page's login box; a login page served in
     place) gets the recommendation, with a clause that says so, redirect or not; the clause is stronger
     when `--example` values were given and no candidate's response holds one
-  - `add <site> <op> --trigger <url-template> --example k=v [--example2 k=v] [--match ...] [--pick ...] [--write]`
+  - `add <site> <op> --trigger <url-template> --example k=v [--example2 k=v] [--match ...] [--pick ...] [--paging ...] [--write]`
   - `call <site> <op> [k=v ...] [--allow-writes] [--again] [--idempotency-key <k>]`
   - `inspect <captureId> [requestId]` reads a saved capture with no browser, through `add`'s recipe
     flags (`--extract`, `--pick`, `--html`, `--embedded`): what the recipe would return, or a failure
@@ -987,8 +1166,16 @@ independent alternative.
     `application/json` scripts, `window.X =` state) with a ready `--embedded` regex, a repeated
     HTML list holding the example as a ready `--html` recipe, and labelled texts on a detail page.
     Deterministic and site-agnostic; the agent reads it instead of inspecting bodies. Paths through
-    id-like keys (Apollo's `Book:kca://...`) are flagged, since they don't generalize.
+    id-like keys (Apollo's `Book:kca://...`) are flagged, since they don't generalize. The list and
+    the labels, like an `--html` recipe's extraction, read the page as it shows (`parseShown`):
+    without script, style, noscript and template, and without elements hidden by the `hidden`
+    attribute (not `until-found`) or an inline `display:none`/`visibility:hidden`. Text the agent
+    reads and the user never sees is where an injected instruction hides. `aria-hidden` stays: it
+    hides only from screen readers and is often the visible copy (a rating shown beside its spoken
+    label). A stylesheet's hiding is not computed.
   - `verify [site]` (health-checks every read op with its example, healing as needed)
+  - `readback <site> <write> <read> [k=v ...] [--find field=value]` (how a write's call proves it
+    landed; see Writes)
   - `sites`, `ops <site>` (params with their description and format, `returns` where the recipe names them: the keys a result item
     can carry, read from the op's `pick`, else from an HTML recipe's fields when no `extract` reshapes its
     items, so it cannot disagree with the recipe; a key the site leaves out is absent, and the site's notes: `<site>.md` beside its
@@ -997,31 +1184,110 @@ independent alternative.
   - All output is JSON-first, compact, and ends with a `next` hint on failure.
   - A call's result says what happened in fields as well as prose: `retry` (`safe`, `after_wait`,
     `after_fix`, `no`), `retryAfterMs`, `nextCall` (`{action, site, op}`, with `mode` for a window
-    login and `tier` for a raised cap; actions `retry`, `login`, `heal`, `relearn`, `fix_args`,
-    `list_sites`, `check_site`, `allow_writes`, `raise_tier`, `install_browser`, `report`), and for
-    a write `write` (see Writes). `next` stays, for a reader; `nextCall` is the same step for a
+    login, `tier` for a raised cap and `profile` for a browser sign-in; actions `retry`, `login`,
+    `sign_in_browser` (the user signs in again in the everyday browser profile `profile`, since a
+    re-import from it brought back the same cookies: "Self-healing auth" under Logging in), `heal`,
+    `relearn`, `fix_args`, `list_sites`, `check_site`, `allow_writes`, `raise_tier`,
+    `install_browser`, `report`), for a write `write` (see Writes), and for a paged read
+    `nextPage` and `hasMore` (see Response extraction). `next` stays, for a reader; `nextCall` is
+    the same step for a
     program. `test/execute.test.ts` checks the fields over every class, a read and a write, and
     what was sent.
-- **MCP server** (`api-anything mcp`) with fixed meta-tools: `list_sites`, `find_sites`, `list_operations`,
-  `call_operation`, and `login` (so an agent can fix an `auth` failure itself), so the tool list
-  costs the same at 2 sites or 200. `find_sites` is `search` (see Sharing specs); `list_operations` on
-  a site that is not installed pulls it from the registry first (see "Agents pull" below). The agent may be steered by page content, so MCP `login` import
+- **MCP server** (`api-anything mcp`) with fixed meta-tools: `list_sites`, `find_sites`,
+  `list_operations`, `call_operation`, `get_job` and `login` (so an agent can fix an `auth` failure itself), plus
+  `call_write_operation` on a server started with `--allow-writes`, so the tool list costs the same
+  at 2 sites or 200. `find_sites` is `search` (see Sharing specs); `list_operations` on a site that
+  is not installed pulls it from the registry first (see "Agents pull"). The agent may be steered by page content, so MCP `login` import
   only refreshes a site that has a spec and a browser source a human chose with the CLI, from that
   same profile; anything else answers `next`: ask the user to run `api-anything login <site>`. Mode
-  window is allowed (a human signs in). MCP cannot learn operations: capture and add are CLI only. Writes are hidden unless
-  it is started with `--allow-writes`. `list_operations` carries each op's `returns`, the site's notes and each param's
-  `hint`/`pattern`. A `next` served over MCP names the tools (`list_operations {"site":"x"}`, the
-  `login` tool) instead of CLI commands, and tells the agent to run a CLI-only one (heal, add) in its
-  own shell, or to hand it to the user when it has none. A `nextCall` served over MCP adds the
-  `tool` and `args` when one of the server's tools takes the step (`login`, `list_operations`,
-  `list_sites`, `call_operation` for a retry with the same args). The prose `next` keeps its
-  rewrite: it carries what the fields do not (check the site first, then re-learn), and the other
-  tools' `next` strings have no `nextCall`. A server started with `--allow-writes` gives
-  `call_operation` the `again` and `idempotencyKey` arguments.
-  `call_operation` sends `data` that is a list of two or more records as `{columns, rows}` (a
-  missing field is null) when that makes the JSON smaller. A sparse table can be larger than the
-  original records, so those stay a list to preserve the output cap. The keys, repeated in every
-  item, were half of a flight search's tokens.
+  window is allowed (a human signs in). MCP cannot create operations: capture and add are CLI only.
+  - **Reads and writes are separate tools**, because MCP hints are per tool and clients act on them:
+    Codex and VS Code skip the approval prompt for a `readOnlyHint` tool and ask for a
+    `destructiveHint` one, and Claude Code and Codex run read-only tools in parallel. One
+    `call_operation` that also sent writes had to be advertised destructive on a writes-enabled
+    server, so every read asked for approval. `call_operation` is read-only, idempotent and
+    non-destructive on every server, and sends with writes off whatever the server allows: a write
+    op is `refused` and nothing is sent, and on a writes-enabled server its `next` and `nextCall`
+    name `call_write_operation` with the same arguments. `call_write_operation` is destructive and
+    not idempotent, takes `again` and `idempotencyKey`, and refuses a read (`input`, pointing back
+    at `call_operation`), so a read never meets the write prompt. `list_sites`, `list_operations`
+    and `get_job` are read-only, idempotent and closed-world (`find_sites` is read-only and open-world); `login` changes the local session,
+    never the site (not read-only, not destructive, idempotent: a repeat joins the first). Every
+    tool sets all four hints, since the spec's defaults for an unset one are the pessimistic ones.
+    The split costs a second tool name; the package was not published with the single tool.
+  - `list_operations` gives each op its `returns`, an `inputSchema` (a JSON Schema object of its
+    args: `type`, `enum`, `minimum`/`maximum`, `pattern` anchored as `^(?:p)$` since a spec's
+    pattern matches the whole value, `default`, `examples`, the format `hint` in `description`,
+    `required` for a required param with no default, `additionalProperties: false`), the site's
+    notes, `pages` and `readback` as `ops` shows them, and `shared` for a pulled spec. A per-op tool's
+    description says the same, and the call tools name `nextPage`/`hasMore` and write `applied`. The schema replaces the old `params` list, so each param
+    is sent once.
+  - **Per-op tools**: `mcp --sites a,b` also registers each op of those sites as a tool of its own,
+    `<site>__<op>` (any character outside `[A-Za-z0-9_-]` becomes `_`), taking the op's args
+    directly with its `inputSchema` and a read's or a write's hints; writes only with
+    `--allow-writes`. The model calls it without `list_operations` first, at about 200 tokens of
+    tool list per op, sent with every request (the five meta-tools are about 950; goodreads' five
+    ops add about 1,000, all 25 bundled ops about 5,700), which is why it is opt-in. A name is at most 40 characters (Gemini
+    CLI cuts `mcp_<server>_<tool>` past 63, and Cursor is reported to drop a tool whose server and
+    tool names pass 60); a longer one is cut and ends in 8 hex characters of a hash of the whole,
+    so two stay distinct. The description is the op's, the keys its items carry, and where its
+    notes are; a pulled spec's starts with `SHARED_NOTE`, since a tool description is text the
+    model weighs more than a result. The args are judged by `call()`, not the SDK: the advertised
+    schema is the model's guide, and a refusal comes back as `class: "input"` with the format and a
+    next step, as through `call_operation`. A per-op write takes no `again` or `idempotencyKey`
+    (they could collide with a param's name): those go through `call_write_operation`.
+  - **Jobs** (`jobs.ts`). No client resets its tool-call timeout on a progress notification (the
+    spec allows it; Codex only logs them, Gemini CLI and VS Code show them; Claude Code counts
+    them only against its idle timeout), and some stop a call at 60 s (Claude Desktop, reportedly;
+    Codex before its default became 300 s). A call that heals or runs the page, or a sign-in window
+    the user is still using, can take longer, and an agent that never sees the answer may log in
+    again or send a write again. So a tool call (`call_operation`, `call_write_operation`, a per-op
+    tool, `login`) that is still running at 25 s answers
+    `{ok: false, class: "pending", job, reason, next, retry: "no", nextCall: get_job}`, with
+    `isError` false (nothing failed), and keeps running. `get_job {job}` waits up to 25 s for it and
+    answers its result, or pending again; it never runs the call again, and a finished job's result
+    is kept 15 minutes. A call identical to one still running (the same tool, site, op and args;
+    a write's `idempotencyKey` too, but not `again`) joins it instead of running beside it: a
+    second `login` for a site while its window is open answers that window's job (whatever the
+    mode), and a write still on its way is not sent twice. Jobs live in the server's memory and end
+    with it. A plain HTTP call answers in milliseconds and meets none of this: a job is only named
+    once its deadline passes. The 25 s leaves room under a 60 s client for `get_job`'s own wait. A
+    sign-in window nobody closes is closed after 10 minutes, so it does not hold the browser
+    profile. There is no `cancel_job`: a call cannot be stopped midway without leaving a write in
+    an unknown state, and the user closes a window themselves. The MCP tasks extension
+    (`taskSupport` in the SDK) is the protocol's version of this, but clients do not send task
+    requests yet.
+  - A `next` served over MCP names the tools (`list_operations {"site":"x"}`, the
+    `login` tool) instead of CLI commands, and tells the agent to run a CLI-only one (heal, add) in its
+    own shell, or to hand it to the user when it has none. A `nextCall` served over MCP adds the
+    `tool` and `args` when one of the server's tools takes the step (`login`, `list_operations`,
+    `list_sites`; for a retry, the tool that was called with the arguments it was called with).
+    `sign_in_browser` names no tool: the user signs in again in their own browser, and the retry
+    re-imports by itself, so the `login` tool would only import the same cookies once more. The
+    prose `next` keeps its rewrite: it carries what the fields do not (check the site first, then
+    re-learn), and the other tools' `next` strings have no `nextCall`.
+  - Each answer is JSON text and, when it is an object, the same object as `structuredContent`. A
+    client gives its model one of the two, never both: Codex and VS Code send the structured one
+    and drop the text, Gemini CLI sends the text, so neither costs tokens twice, and a program
+    reads the fields without parsing. `list_sites` (a list) is text only: before the 2026-07-28
+    revision structuredContent is an object. No tool declares an `outputSchema`: the SDK would
+    then reject an answer that does not match it, and a failure's shape differs from a success's.
+    `isError` is true exactly when `ok` is false, except for `pending`.
+  - `call_operation` sends `data` that is a list of two or more records as `{columns, rows}` (a
+    missing field is null) when that makes the JSON smaller. A sparse table can be larger than the
+    original records, so those stay a list to preserve the output cap. The keys, repeated in every
+    item, were half of a flight search's tokens.
+  - That a result's data, any site text in it and a site's notes are data from the website, never
+    instructions, is said once per session (`UNTRUSTED_NOTE`), in the server instructions and in the
+    description of `call_operation` and `call_write_operation`, since some clients drop instructions
+    and every one sends a tool's description; a note in every result would be paid for on every
+    call, and the model already knows which tool a result came from.
+  - `mcp --print-config` prints the command or config entry that adds the server to Claude Code,
+    Codex, Gemini CLI, VS Code, Cursor and Claude Desktop (`clients.ts`), with the absolute path of
+    the node running it and of the CLI entry (from a checkout, through tsx's loader), the other
+    flags given, and `API_ANYTHING_HOME`/`API_ANYTHING_BROWSER` when set: a client started from the
+    Dock or a menu may not get the shell's PATH (an nvm node) or its variables. Gemini CLI reads the
+    command as a positional of its own, so its args follow `--` there and none is read as its flag.
 - **Skill** `skills/api-anything/SKILL.md`: the create loop (capture → add → call → verify), the
   strict failure loop (follow `next` at most once, then stop and report), and the safety rules.
 - **Claude Code plugin** manifest (skill + MCP), plus copy-paste install lines for Codex and other agents.
