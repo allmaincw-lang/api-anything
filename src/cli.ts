@@ -1,11 +1,13 @@
 #!/usr/bin/env node
 /** api-anything CLI. Compact JSON on stdout; every failure also prints one `next:` line on stderr. */
 import { readFileSync, writeFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { z } from "zod";
-import { browserAvailable, closeBrowser, login, ProfileInUse } from "./browser.js";
+import { browserAvailable, closeBrowser, ProfileInUse } from "./browser.js";
 import { verifySite } from "./checks.js";
 import { botWall, emptyResults, loginPath, signInForm } from "./classify.js";
+import { launchOf, printConfig } from "./clients.js";
 import { call, heal, type Tier } from "./execute.js";
 import { capOutput, extract, getPath, innerJson, pick, returnedFields, splitPick } from "./extract.js";
 import {
@@ -16,25 +18,42 @@ import {
   fillTrigger,
   loadCapture,
   PROFILE_HINT,
-  profileDir,
   unplaced,
 } from "./heal.js";
 import { buildRequest } from "./http.js";
 import { AmbiguousProfile } from "./import.js";
 import { type Candidate, capturePages, pageUrls, rankCandidates } from "./learn.js";
 import { learnSite } from "./learnsite.js";
-import { cookieNames, importSession, logout, resolveLoginTarget } from "./login.js";
+import {
+  cookieNames,
+  importSession,
+  importWarning,
+  knownGuests,
+  logout,
+  resolveLoginTarget,
+  windowLogin,
+  windowRetry,
+} from "./login.js";
 import { type Outline, outline } from "./outline.js";
 import { plan, uploadName } from "./publish.js";
 import { pull, search } from "./registry.js";
 import { settle } from "./report.js";
-import { loadSession, loggedIn, saveSession, sessionFile, withLock } from "./session.js";
+import { loadSession } from "./session.js";
 import { AGENTS, type Agent, askYesNo, setup, summary } from "./setup.js";
 import { shareOps } from "./share.js";
-import { CheckSchema, HtmlRecipeSchema, MatchSchema, type Operation, type Param, TriggerStepSchema } from "./spec.js";
+import {
+  CheckSchema,
+  HtmlRecipeSchema,
+  MatchSchema,
+  type Operation,
+  type Paging,
+  type Param,
+  type Readback,
+  TriggerStepSchema,
+} from "./spec.js";
 import { exportSite, listSites, loadSite, siteNotes, updateSite } from "./store.js";
 import type { Exchange, TriggerStep } from "./types.js";
-import { SHARED_NOTE } from "./vet.js";
+import { readbackProblems, SHARED_NOTE } from "./vet.js";
 
 const VERSION = (JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as { version: string })
   .version;
@@ -66,7 +85,11 @@ const HELP: Record<string, string> = {
               remembered: a later automatic re-import uses the same profile.
   --window    open a visible browser window to sign in by hand (an independent session); also the
               automatic fallback when nothing is importable. This is where you solve 2FA/captchas.
-  --cookies   import a cookies.txt (Netscape) or JSON export (Cookie-Editor / Playwright), for CI`,
+              It counts only if a login cookie appears or changes while it is open; else ok:false
+              and the stored session is kept.
+  --cookies   import a cookies.txt (Netscape) or JSON export (Cookie-Editor / Playwright), for CI
+  Output: loggedIn, renewed (new login cookies), and a warning when the cookies show no sign-in or
+  are the ones the session already had. Cookies every signed-out visitor gets never count.`,
   logout: `api-anything logout <site>
   Clears the stored cookie jar and this site's cookies in api-anything's browser profile.`,
   capture: `api-anything capture <url> [--steps <json>] [--soft-from <url>] [--example k=v]... [--write] [--limit n] [--outline]
@@ -118,7 +141,14 @@ const HELP: Record<string, string> = {
   --enum name=a,b,c  the values a param takes: the site's whole set (its picker's options), not only the
                   example's; a call with another is refused as input, and nothing is sent
   --min name=n, --max name=n  bounds on a param's value read as a number (a page, a count, a price)
-                  An op learned again keeps its params' allowed values and descriptions, and its checks.
+  --paging <param>[=<path>]  a read whose list pages: <param> takes the next page, and <path> (in the
+                  whole response, before --extract) is where the response gives the next page's cursor,
+                  which a call returns as nextPage (hasMore false: the site said there is no next page).
+                  Without =<path> the pages are numbered, and a call says nothing about the next one.
+                  The param must be in the request: to page by a cursor, learn the op from the request
+                  that loads page 2 ("Show more"), so the cursor is a param
+                  An op learned again keeps its params' allowed values and descriptions, its checks,
+                  its paging and its readback.
   Output: preview (what a call returns, from the captured response), warnings (read them), captures.
   replaced: an op of that name was learned again. unproven: example 2 was answered with example 1's
   data, so nothing shows the server reads those params (publish refuses the op until it does).
@@ -127,7 +157,9 @@ const HELP: Record<string, string> = {
   call: `api-anything call <site> <op> [k=v ...] [--json <args-object>] [--allow-writes] [--again] [--idempotency-key <k>] [--max-tier 1|2|3] [--dry]
   Calls an operation: {ok, class, data, tier, healed?, ms, next?}; a failure also says retry
   (safe, after_wait, after_fix, no), retryAfterMs and nextCall, and a write says write (not_sent,
-  not_applied, accepted, may_have_applied). --dry prints the request with credentials redacted.
+  not_applied, accepted, may_have_applied, applied: its readback found it). A paged read says
+  nextPage (pass it as the op's paging param) and hasMore. --dry prints the request with
+  credentials redacted.
   --again           send a write refused as a duplicate (the same args within 10 minutes, and the
                     first may have gone through): only when the user checked the site
   --idempotency-key <k>  a repeat of a write with the same key returns the first call's record`,
@@ -136,13 +168,22 @@ const HELP: Record<string, string> = {
   judges each case: pass, fail, or inconclusive (a challenge, a sign-in page, a rate limit, or a server
   that failed or could not be reached: it says nothing about the op). The outcomes are kept per op, for
   publish. An op marked unproven loses the mark when two passing cases that differ only in its
-  unproven params answer differently.`,
+  unproven params answer differently. A paged read also asks for the page after its example's
+  ("next page"): an answer with only page 1's items again fails.`,
   check: `api-anything check <site> <op> [k=v ...] --expect result|empty|input [--purpose <text>]
   Records a check on a read: args a human confirmed on the site, and what the site answers them with
   (result: data; empty: no data, the site's own no-results; input: the site refuses the args). verify
   runs it; publish refuses while one fails, and shares the checks with the spec, so use only public
   values. Choose values that exclude something: an empty check (a filter no row passes) shows a param
   the server ignores. A check with the same args replaces the old one; remove one by editing the spec.`,
+  readback: `api-anything readback <site> <write-op> <read-op> [k=v ...] [--find <field>=<value>]
+  How a write's call proves it landed: after the write is sent and accepted (or may have run), the
+  call runs <read-op> once with these args (a read, never a second send). Finding it makes the
+  call's write "applied"; not finding it changes nothing (the site may show it later). A value may
+  be {param}, filled from the write's args: list={list}. --find title={title}: an item of the read's
+  result whose title equals the write's; without --find, any data counts. Use something only this
+  write makes (a title the caller chose, an id), or an older item can pass for it. Replaces the op's
+  readback; remove one by editing the spec.`,
   sites: `api-anything sites
   Lists known sites (user specs in ~/.api-anything/sites win over bundled ones).`,
   ops: `api-anything ops <site>
@@ -172,14 +213,20 @@ const HELP: Record<string, string> = {
   literal typed into the page). The param examples are sent: they must be values anyone may see. It
   refuses an op holding a live cookie or session value, or failing its checks. --yes sends them, signed
   with this install's key; an op that needed a login or writes is reviewed before others get it.`,
-  mcp: `api-anything mcp [--allow-writes] [--no-learn]
-  Serves list_sites, find_sites, list_operations, call_operation, login and learn_site over stdio MCP.
-  list_operations and call_operation pull a shared site an agent asks for, with its reads only: its
-  writes need a human's api-anything pull. Its login only refreshes a session a human imported here.
-  With sharing on, an idle server checks a few new shared operations a day, over plain HTTP with no
-  cookies, and reports how calls went. learn_site learns a read (as learn does); writes are learned
-  here with add --write.
-  --no-learn   hide learn_site`,
+  mcp: `api-anything mcp [--allow-writes] [--sites a,b] [--print-config] [--no-learn]
+  Serves list_sites, find_sites, list_operations, call_operation, get_job, login and learn_site over
+  stdio MCP, and call_write_operation with --allow-writes. list_operations and call_operation pull a
+  shared site an agent asks for, with its reads only: its writes need a human's api-anything pull. Its
+  login only refreshes a session a human imported here. A call still running after about 25 s answers
+  class pending with a job, which get_job waits for. With sharing on, an idle server checks a few new
+  shared operations a day, over plain HTTP with no cookies, and reports how calls went. learn_site
+  learns a read (as learn does); writes are learned here with add --write.
+  --sites a,b     also serve each operation of these sites as a tool of its own (goodreads__searchBooks),
+                  with its args' JSON Schema: no list_operations step first. Costs tokens per op
+  --print-config  print the command or config entry that adds this server to Claude Code, Codex,
+                  Gemini CLI, VS Code, Cursor and Claude Desktop, with absolute paths and the other
+                  flags given, instead of serving
+  --no-learn      hide learn_site`,
   setup: `api-anything setup [--yes | --no-share] [--agents claude-code,codex,cursor,claude-desktop] [--dry-run]
   Connects the MCP server (npx -y api-anything mcp) to each agent found on this machine: Claude Code,
   Codex, Cursor, Claude Desktop. Installs the skill for Claude Code (~/.claude/skills) and Codex
@@ -216,7 +263,9 @@ const USAGE = `api-anything ${VERSION}: turn a website into operations an agent 
   api-anything inspect <captureId> [<requestId>]
   api-anything search <words|domain> | pull <site> | publish <site> [--yes]
   api-anything check <site> <op> [k=v ...] --expect result|empty|input
-  api-anything verify [site] | sites | ops <site> | heal <site> <op> | export <site> | mcp
+  api-anything readback <site> <write-op> <read-op> [k=v ...] [--find field=value]
+  api-anything verify [site] | sites | ops <site> | heal <site> <op> | export <site>
+  api-anything mcp [--allow-writes] [--sites a,b] [--print-config]
 
 api-anything <command> --help for details. Data lives in ~/.api-anything (API_ANYTHING_HOME overrides).`;
 
@@ -343,6 +392,10 @@ const OPTIONS = {
   "dry-run": { type: "boolean" },
   "no-share": { type: "boolean" },
   "no-learn": { type: "boolean" },
+  paging: { type: "string" },
+  find: { type: "string" },
+  sites: { type: "string" },
+  "print-config": { type: "boolean" },
 } as const;
 
 /** What a command gets: the flags, the positionals after the command name, and the parsed --steps. */
@@ -372,23 +425,24 @@ async function cmdLogin({ v, pos }: Parsed): Promise<number> {
     process.stderr.write(
       `${reason ? `${reason} ` : ""}Sign in to ${url} in the browser window, then close it or press Enter here.\n`,
     );
-    const cookies = await login({ url, profileDir: profileDir() });
-    withLock(sessionFile(site), () => saveSession(site, { ...loadSession(site), cookies, source: "window" }));
-    out({
-      ok: true,
-      site,
-      source: "window",
-      cookies: cookieNames(cookies),
-      loggedIn: loggedIn(cookies, loginCookies),
-    });
+    const w = await windowLogin(site, url, { loginCookies });
+    if (!w.ok)
+      throw new Fail(w.reason, windowRetry(site, `api-anything login ${site} --window`), {
+        site,
+        source: "window",
+        cookies: cookieNames(w.cookies),
+      });
+    out({ ok: true, site, source: "window", cookies: cookieNames(w.cookies), loggedIn: true, renewed: w.renewed });
     return 0;
   };
 
   if (v.window) return runWindow();
 
+  // what a signed-out visit is given, so those names do not pass for a sign-in
+  const guest = await knownGuests(site, url, loginCookies);
   let imported: Awaited<ReturnType<typeof importSession>>;
   try {
-    imported = await importSession(site, url, { loginCookies, profile: v.profile, file: v.cookies });
+    imported = await importSession(site, url, { loginCookies, profile: v.profile, file: v.cookies, guest });
   } catch (e) {
     if (!(e instanceof AmbiguousProfile)) throw e;
     throw new Fail(
@@ -414,10 +468,14 @@ async function cmdLogin({ v, pos }: Parsed): Promise<number> {
     ...(imported.name ? { profileName: imported.name } : {}),
     ...(imported.email ? { account: imported.email } : {}),
     cookies: cookieNames(imported.cookies),
-    loggedIn: loggedIn(imported.cookies, loginCookies),
+    loggedIn: imported.signedIn,
+    renewed: imported.renewed,
+    ...withWarning(importWarning(url, imported)),
   });
   return 0;
 }
+
+const withWarning = (warning: string | undefined) => (warning ? { warning } : {});
 
 async function cmdLogout({ pos }: Parsed): Promise<number> {
   const site = pos[0];
@@ -679,6 +737,17 @@ function allowedOf(v: Parsed["v"]): Record<string, Pick<Param, "enum" | "min" | 
   return out;
 }
 
+/** --paging <param>[=<path to the next cursor>] */
+function pagingOf(flag: string | undefined): Paging | undefined {
+  if (flag === undefined) return undefined;
+  const eq = flag.indexOf("=");
+  const param = (eq < 0 ? flag : flag.slice(0, eq)).trim();
+  const next = eq < 0 ? undefined : flag.slice(eq + 1).trim();
+  if (!param || next === "")
+    throw new Fail(`--paging ${flag}: give <param> or <param>=<path>`, "api-anything add --help");
+  return { param, ...(next ? { next } : {}) };
+}
+
 /** What a repair says it changed: the op was kept, and one thing in it replaced. */
 async function cmdAdd({ v, pos, steps }: Parsed): Promise<number> {
   const [site, name] = pos;
@@ -732,6 +801,7 @@ async function cmdAdd({ v, pos, steps }: Parsed): Promise<number> {
       : undefined,
     from2: v.from2 ? loadCapture(v.from2) : undefined,
     allowed: allowedOf(v),
+    paging: pagingOf(v.paging),
   });
   const op = r.operation;
   out({
@@ -745,6 +815,8 @@ async function cmdAdd({ v, pos, steps }: Parsed): Promise<number> {
     minTier: op.minTier,
     match: op.match,
     ...(op.response.extract ? { extract: op.response.extract } : {}),
+    ...(op.paging ? { paging: op.paging } : {}),
+    ...(op.readback ? { readback: op.readback } : {}),
     ...(r.preview ? { preview: r.preview } : {}),
     ...(op.unproven ? { unproven: op.unproven.params } : {}),
     warnings: r.warnings,
@@ -890,6 +962,38 @@ async function cmdCheck({ v, pos }: Parsed): Promise<number> {
   return 0;
 }
 
+/** readback <site> <write> <read> [k=v ...] [--find field=value]: how a write's call proves it landed. */
+function cmdReadback({ v, pos }: Parsed): number {
+  const [site, name, readOp, ...rest] = pos;
+  if (!site || !name || !readOp) throw new Fail("missing <site> <write-op> <read-op>", "api-anything readback --help");
+  const s = requireSite(site).site;
+  const op = s.operations.find((o) => o.name === name);
+  if (!op) throw new Fail(`no operation "${name}" on ${site}`, `api-anything ops ${site}`);
+  let find: Readback["find"];
+  if (v.find !== undefined) {
+    const eq = v.find.indexOf("=");
+    if (eq < 1) throw new Fail(`--find ${v.find}: give <field>=<value>`, "api-anything readback --help");
+    find = { field: v.find.slice(0, eq), equals: v.find.slice(eq + 1) };
+  }
+  const readback: Readback = { op: readOp, args: kv(rest), ...(find ? { find } : {}) };
+  const problems = readbackProblems(s, { ...op, readback });
+  if (problems.length)
+    throw new Fail(problems.join("; "), `api-anything ops ${site} shows the params of ${name} and ${readOp}`);
+  const path = updateSite(site, (cur) => {
+    if (!cur) throw new Error(`site "${site}" disappeared`);
+    return { ...cur, operations: cur.operations.map((o) => (o.name === name ? { ...o, readback } : o)) };
+  });
+  out({
+    ok: true,
+    site,
+    op: name,
+    readback,
+    saved: path,
+    next: `api-anything call ${site} ${name} ... --allow-writes`,
+  });
+  return 0;
+}
+
 function cmdSites(): number {
   out(
     listSites().map((name) => {
@@ -932,6 +1036,10 @@ function cmdOps({ pos }: Parsed): number {
       ),
       ...(o.minTier > 1 ? { minTier: o.minTier } : {}),
       ...(o.checks?.length ? { checks: o.checks.length } : {}),
+      ...(o.paging
+        ? { pages: o.paging.next ? `by ${o.paging.param}: pass the result's nextPage` : `by ${o.paging.param}` }
+        : {}),
+      ...(o.readback ? { readback: o.readback.op } : {}),
       ...(o.unproven ? { unproven: o.unproven.reason } : {}),
       trigger: o.trigger.url,
     })),
@@ -1114,8 +1222,22 @@ async function cmdLearn({ v, pos }: Parsed): Promise<number> {
 
 async function cmdMcp({ v }: Parsed): Promise<number> {
   if (v["no-learn"]) (await import("./mcp-learn.js")).learnTool.enabled = false;
+  const sites = (v.sites ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  for (const s of sites) if (!loadSite(s)) throw new Fail(`no site "${s}"`, "api-anything sites lists them");
+  if (v["print-config"]) {
+    const flags = [
+      ...(v["allow-writes"] ? ["--allow-writes"] : []),
+      ...(sites.length ? ["--sites", sites.join(",")] : []),
+      ...(v["no-learn"] ? ["--no-learn"] : []),
+    ];
+    process.stdout.write(`${printConfig(launchOf(fileURLToPath(import.meta.url), flags))}\n`);
+    return 0;
+  }
   const { serveStdio } = await import("./mcp.js");
-  await serveStdio({ allowWrites: v["allow-writes"] });
+  await serveStdio({ allowWrites: v["allow-writes"], sites });
   return -1; // keep serving
 }
 
@@ -1148,11 +1270,13 @@ const COMMANDS: Record<string, { run: (p: Parsed) => number | Promise<number>; f
       "enum",
       "min",
       "max",
+      "paging",
     ],
   },
   call: { run: cmdCall, flags: ["json", "allow-writes", "again", "idempotency-key", "max-tier", "dry"] },
   verify: { run: cmdVerify, flags: [] },
   check: { run: cmdCheck, flags: ["expect", "purpose"] },
+  readback: { run: cmdReadback, flags: ["find"] },
   sites: { run: cmdSites, flags: [] },
   ops: { run: cmdOps, flags: [] },
   heal: { run: cmdHeal, flags: [] },
@@ -1160,7 +1284,7 @@ const COMMANDS: Record<string, { run: (p: Parsed) => number | Promise<number>; f
   search: { run: cmdSearch, flags: [] },
   pull: { run: cmdPull, flags: [] },
   publish: { run: cmdPublish, flags: ["yes"] },
-  mcp: { run: cmdMcp, flags: ["allow-writes", "no-learn"] },
+  mcp: { run: cmdMcp, flags: ["allow-writes", "sites", "print-config", "no-learn"] },
   setup: { run: cmdSetup, flags: ["yes", "no-share", "agents", "dry-run"] },
   learn: {
     run: cmdLearn,

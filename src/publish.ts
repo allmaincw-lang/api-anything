@@ -24,10 +24,11 @@ const EMAIL = /[\w.+-]+@[\w-]+(\.[\w-]+)+/;
 const UUID = /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/i;
 
 /**
- * What in an upload may be the publisher's own, for them to look at: no scan tells an account id from
- * a constant. Every string and key of the op and the site's fields is read, and the notes.
+ * An email address, a UUID or an IP address in any string or key of `value`: what may be someone's
+ * own, which no scan tells from a constant. Publish shows them to the publisher; the recorded site
+ * fixtures (test/fixture/sites) must have none.
  */
-function personal(u: VersionUpload): string[] {
+export function personalIn(value: unknown, path = "$"): string[] {
   const found: string[] = [];
   const check = (text: string, where: string) => {
     if (EMAIL.test(text)) found.push(`${where} holds an email address (${EMAIL.exec(text)![0]})`);
@@ -35,18 +36,26 @@ function personal(u: VersionUpload): string[] {
     const ip = ipIn(text);
     if (ip) found.push(`${where} holds the IP address ${ip}`);
   };
-  const visit = (v: unknown, path: string) => {
-    if (typeof v === "string") check(v, path);
-    else if (Array.isArray(v)) for (const [i, x] of v.entries()) visit(x, `${path}[${i}]`);
+  const visit = (v: unknown, at: string) => {
+    if (typeof v === "string") check(v, at);
+    else if (Array.isArray(v)) for (const [i, x] of v.entries()) visit(x, `${at}[${i}]`);
     else if (v && typeof v === "object")
       for (const [k, x] of Object.entries(v)) {
-        check(k, `a key in ${path}`);
-        visit(x, `${path}.${k}`);
+        check(k, `a key in ${at}`);
+        visit(x, `${at}.${k}`);
       }
   };
+  visit(value, path);
+  return found;
+}
+
+/**
+ * What in an upload may be the publisher's own, for them to look at: no scan tells an account id from
+ * a constant. Every string and key of the op and the site's fields is read, and the notes.
+ */
+function personal(u: VersionUpload): string[] {
   const { notes, ...site } = u.site;
-  visit(site, "$.site");
-  visit(u.operation, "$.operation");
+  const found = [...personalIn(site, "$.site"), ...personalIn(u.operation, "$.operation")];
   const op = u.operation;
   const at = `$.operation`;
   for (const seg of new URL(op.request.url).pathname.split("/"))
@@ -68,7 +77,7 @@ function personal(u: VersionUpload): string[] {
         .map(([k, v]) => `${k}=${v}`)
         .join(" ")}: is every value public, none of them yours?`,
     );
-  if (notes) check(notes, "the notes");
+  if (notes) found.push(...personalIn(notes, "the notes"));
   return found;
 }
 

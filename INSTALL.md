@@ -44,6 +44,13 @@ npx -y api-anything call hacker-news search query=sqlite
 
 Expect `"ok":true` and `"tier":1`, a plain HTTP call with no browser.
 
+For an MCP client `setup` does not know (Gemini CLI, VS Code), run `npx -y api-anything mcp --print-config`
+and use the entry it prints for that client: it names `node` and the CLI by absolute path, because a
+client started from the Dock or a menu may not get the shell's `PATH`.
+
+If a client later fails to start the server or times out, the per-client timeouts and a list of
+fixes are in [docs/QUICKSTART.md](docs/QUICKSTART.md#client-timeouts).
+
 ## 5. Tell the user
 
 - What setup connected, from its summary, and what step 4 returned.
