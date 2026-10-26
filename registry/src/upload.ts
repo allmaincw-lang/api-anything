@@ -33,6 +33,7 @@ const UploadSchema = z.object({
     tier: Tier.optional(),
     healedFrom: HASH.optional(),
   }),
+  claim: HASH.optional(),
 });
 
 const issues = (e: z.ZodError) => e.issues.map((i) => `${i.path.join(".") || "body"}: ${i.message}`);
@@ -185,6 +186,7 @@ export interface Upload {
   parent?: string;
   evidence: Evidence;
   hash: string;
+  claim?: string;
 }
 
 /** An upload's body, parsed and held to the shared rules, or why it is refused. */
@@ -208,5 +210,6 @@ export async function readUpload(body: unknown): Promise<Upload | { errors: stri
     ...(r.data.parent ? { parent: r.data.parent } : {}),
     evidence,
     hash: await versionHash(site.name, parsed.op),
+    ...(r.data.claim ? { claim: r.data.claim } : {}),
   };
 }

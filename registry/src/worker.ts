@@ -1,6 +1,16 @@
 /** The registry Worker: the HTTP surface of src/registry-api.ts, the pages, and the daily archive. */
 import { z } from "zod";
-import type { Report, Status, UploadResult, VerifyJob } from "../../src/registry-api.js";
+import {
+  anonymous,
+  type ClaimResult,
+  canonical,
+  fingerprintText,
+  nameHashText,
+  type Report,
+  type Status,
+  type UploadResult,
+  type VerifyJob,
+} from "../../src/registry-api.js";
 import type { Operation } from "../../src/spec.js";
 import { networksOf, sha256Hex, signatureHeaders, signer } from "./auth.js";
 import { catalog, confirmed, entryOf, search } from "./catalog.js";
@@ -12,6 +22,7 @@ import {
   archive,
   archiveCandidates,
   archiveOldSeeds,
+  claimsOf,
   count,
   type D1Database,
   facts,
@@ -19,7 +30,9 @@ import {
   getKey,
   getSite,
   getVersion,
+  holders,
   incumbentSig,
+  putClaim,
   putReport,
   reseed,
   seedSite,
@@ -30,6 +43,7 @@ import {
   unverified,
   type VersionRow,
   versionsIn,
+  wantedClaims,
 } from "./store.js";
 import {
   HASH,
@@ -40,6 +54,7 @@ import {
   refusals,
   reviewReasons,
   SiteContextSchema,
+  type Upload,
   versionHash,
 } from "./upload.js";
 
@@ -261,6 +276,13 @@ async function upload(c: Ctx) {
     throw new HttpError(409, "the version is refused", [`the name ${u.site.name} is bound to ${bound.domain}`]);
   const squat = bound ? undefined : nameRefusal(u.site.name, u.site.domain);
   if (squat) throw new HttpError(422, "the version is refused", [squat]);
+  const claimed = u.claim ? await answersClaim(c, u, key) : undefined;
+  if (claimed) {
+    u.operation = claimed.operation;
+    u.hash = await versionHash(u.site.name, u.operation);
+    // the site's words are one person's too
+    u.site = { name: u.site.name, domain: u.site.domain, baseUrl: u.site.baseUrl };
+  }
 
   const held = await getVersion(db, u.hash);
   if (held) {
@@ -284,6 +306,7 @@ async function upload(c: Ctx) {
     ...(incumbent ? { incumbentSig: incumbent } : {}),
   });
   const heal = await isHeal(c, u.evidence.healedFrom, u.site.name, u.operation.name, key);
+  if (claimed) reasons.push(claimed.reason);
   const status: Status = reasons.length ? "review" : "candidate";
   // an uploaded title could claim any brand: a site nobody seeded is titled by its domain
   await addSite(db, { ...u.site, displayName: u.site.domain }, key, now);
@@ -301,6 +324,7 @@ async function upload(c: Ctx) {
       uploader: key,
       uploaderNetwork: network,
       evidence: u.evidence,
+      ...(u.claim ? { claim: u.claim } : {}),
     },
     now,
   );
@@ -308,6 +332,57 @@ async function upload(c: Ctx) {
     { hash: u.hash, status, duplicate: false, ...(reasons.length ? { reasons } : {}) } satisfies UploadResult,
     201,
   );
+}
+
+/**
+ * An upload that answers a claim: allowed only from an install that claimed the fingerprint, once
+ * `claimKeys` installs on as many networks did, with the op in its anonymous form hashing to it. The
+ * op keeps its name only if as many of them gave it that name; otherwise it is named by its fingerprint.
+ */
+async function answersClaim(c: Ctx, u: Upload, key: string): Promise<{ operation: Operation; reason: string }> {
+  const fingerprint = u.claim!;
+  const refuse = (why: string) => new HttpError(422, "the version is refused", [why]);
+  const rows = (await claimsOf(c.env.DB, fingerprint)).filter((r) => r.site === u.site.name);
+  if (!rows.some((r) => r.key === key)) throw refuse("this install did not claim that fingerprint");
+  const n = holders(rows);
+  if (n < c.t.claimKeys) throw refuse(`fewer than ${c.t.claimKeys} installs on distinct networks claimed it`);
+  const op = anonymous(u.operation);
+  if (canonical(op) !== canonical(u.operation)) throw refuse("an op answering a claim is sent in its anonymous form");
+  if ((await sha256Hex(fingerprintText(u.site.name, op))) !== fingerprint)
+    throw refuse("the op does not hash to the claimed fingerprint");
+  const nameHash = await sha256Hex(nameHashText(op.name));
+  const named = holders(rows.filter((r) => r.name_hash === nameHash)) >= c.t.claimKeys;
+  return {
+    operation: named ? op : { ...op, name: `op_${fingerprint.slice(0, 8)}` },
+    reason: `learned signed in; ${n} installs on distinct networks hold this exact op`,
+  };
+}
+
+const ClaimSchema = z.object({
+  site: z.object({ name: z.string().regex(/^[a-z0-9][a-z0-9._-]{0,63}$/), domain: z.string().max(253) }),
+  fingerprint: HASH,
+  nameHash: HASH,
+});
+
+async function claims(c: Ctx) {
+  const key = await keyOf(c, true);
+  if (c.request.method === "POST") {
+    const r = ClaimSchema.safeParse(parseJson(c.body));
+    if (!r.success) throw new HttpError(400, "the body is a Claim", issues(r.error));
+    const { network, prefix } = await networksOf(c.request, salt(c));
+    await spend(c, "upload", key, prefix, 1);
+    const bound = await getSite(c.env.DB, r.data.site.name);
+    if (bound && bound.domain !== r.data.site.domain)
+      throw new HttpError(409, "the claim is refused", [`the name ${r.data.site.name} is bound to ${bound.domain}`]);
+    const squat = bound ? undefined : nameRefusal(r.data.site.name, r.data.site.domain);
+    if (squat) throw new HttpError(422, "the claim is refused", [squat]);
+    await putClaim(
+      c.env.DB,
+      { fingerprint: r.data.fingerprint, site: r.data.site.name, key, network, name_hash: r.data.nameHash },
+      new Date(c.now).toISOString(),
+    );
+  }
+  return json({ wanted: await wantedClaims(c.env.DB, key, c.t.claimKeys) } satisfies ClaimResult);
 }
 
 const ReportSchema = z.object({
@@ -454,6 +529,8 @@ const ROUTES: [method: string, path: RegExp, handler: Handler, auth?: Auth, maxB
   ["GET", /^\/v1\/verify-jobs$/, verifyJobs, "signed"],
   ["POST", /^\/v1\/versions$/, upload, "signed"],
   ["POST", /^\/v1\/reports$/, reports, "signed"],
+  ["POST", /^\/v1\/claims$/, claims, "signed"],
+  ["GET", /^\/v1\/claims$/, claims, "signed"],
   ["POST", /^\/v1\/admin\/versions\/([0-9a-f]{64})$/, adminVersion, "admin"],
   ["POST", /^\/v1\/admin\/seed$/, adminSeed, "admin", MAX_SEED],
   ["GET", /^\/$/, home],

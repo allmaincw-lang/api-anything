@@ -99,8 +99,19 @@ export async function verifyCandidates(
   return ran;
 }
 
+const CLAIMS_EVERY_MS = 6 * 60 * 60_000;
+let claimsAt = 0;
+
+/** Whether an idle round asks the registry about this install's claims: at most every 6 hours. */
+function claimsDue(now = Date.now()): boolean {
+  if (now - claimsAt < CLAIMS_EVERY_MS) return false;
+  claimsAt = now;
+  return true;
+}
+
 /**
- * Runs `verifyCandidates` once the server has been idle for `idleMs`, and flushes reports every
+ * Runs `verifyCandidates` once the server has been idle for `idleMs`, then answers any claim the
+ * registry asks for (`answerClaims`, at most every 6 hours), and flushes reports every
  * `everyMs`. `touch` marks activity; `stop` ends it and the round in flight.
  */
 export function idleWork(o: { idleMs?: number; everyMs?: number } = {}): { touch: () => void; stop: () => void } {
@@ -112,10 +123,15 @@ export function idleWork(o: { idleMs?: number; everyMs?: number } = {}): { touch
     if (busy) return;
     if (Date.now() - last < idleMs) return void flushReports(stopper.signal).catch(() => undefined);
     busy = true;
-    void verifyCandidates({ signal: stopper.signal }).finally(() => {
-      busy = false;
-      last = Date.now();
-    });
+    void verifyCandidates({ signal: stopper.signal })
+      .then(async () => {
+        if (claimsDue()) await (await import("./share.js")).answerClaims(undefined, stopper.signal);
+      })
+      .catch(() => undefined)
+      .finally(() => {
+        busy = false;
+        last = Date.now();
+      });
   }, o.everyMs ?? 5_000);
   timer.unref();
   return {
