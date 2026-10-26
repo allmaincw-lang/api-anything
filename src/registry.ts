@@ -11,7 +11,7 @@ import { loadSettings, signedHeaders } from "./identity.js";
 import { REGISTRY_API, type ServedSite, type Status } from "./registry-api.js";
 import { indexEntry, score, summarize } from "./search.js";
 import { dropUnbound, home, loadSession, readJson, safeName, siteOf, writePrivate } from "./session.js";
-import { parseSite, type Site } from "./spec.js";
+import { type Operation, parseSite, type Site } from "./spec.js";
 import { listSites, loadSite, registryDir, updateSite } from "./store.js";
 import { LIMITS, vetShared } from "./vet.js";
 
@@ -209,6 +209,58 @@ function changes(before: Site, after: Site) {
     changed: [...now].filter(([n, s]) => old.has(n) && old.get(n) !== s).map(([n]) => n),
     removed: [...old.keys()].filter((n) => !now.has(n)),
   };
+}
+
+/** How long a drifted call waits for the registry before it heals on its own. */
+const SERVED_NOW_MS = 3_000;
+
+const sameMatch = (a: Operation, b: Operation) =>
+  (a.match.method ?? a.request.method).toUpperCase() === (b.match.method ?? b.request.method).toUpperCase() &&
+  (a.match.host ?? "") === (b.match.host ?? "") &&
+  (a.match.path ?? "") === (b.match.path ?? "") &&
+  (a.match.operationName ?? "") === (b.match.operationName ?? "");
+
+/**
+ * A drifted op that is a registry version: the version the registry serves for it now, when that is
+ * another live one with the same match (another install's repair, promoted, or the next best after this
+ * one degraded). It replaces the op where this machine reads it, the rest of the spec untouched, and is
+ * returned for the call to try: one request in place of a browser heal. Undefined when the registry
+ * serves nothing else, cannot be reached in 3 s, or serves something the shared rules refuse.
+ */
+export async function servedNow(
+  name: string,
+  op: Operation,
+  o: { signal?: AbortSignal } = {},
+): Promise<Operation | undefined> {
+  if (!op.version || !op.readOnly) return undefined;
+  name = safeName(name);
+  const r = loadSite(name);
+  if (!r || r.source === "bundled") return undefined;
+  let served: ServedSite;
+  try {
+    served = await registryRequest<ServedSite>(`/v1/sites/${name}`, {
+      cap: LIMITS.file + LIMITS.notes + 64 * 1024,
+      timeoutMs: SERVED_NOW_MS,
+      signal: o.signal,
+    });
+  } catch {
+    return undefined;
+  }
+  let site: Site;
+  try {
+    site = siteFrom(name, served);
+  } catch {
+    return undefined;
+  }
+  const next = site.operations.find((x) => x.name === op.name);
+  if (!next?.version || next.version.hash === op.version.hash || next.version.status !== "live") return undefined;
+  if (!next.readOnly || !sameMatch(op, next)) return undefined;
+  if (vetShared({ ...r.site, operations: [next] }).errors.length) return undefined;
+  if (siteOf(new URL(site.baseUrl).hostname) !== siteOf(new URL(r.site.baseUrl).hostname)) return undefined;
+  const swap = (s: Site): Site => ({ ...s, operations: s.operations.map((x) => (x.name === op.name ? next : x)) });
+  if (r.source === "registry") writePrivate(r.path, `${JSON.stringify(swap(r.site), null, 2)}\n`);
+  else updateSite(name, (cur) => swap(cur ?? r.site));
+  return next;
 }
 
 const upgradesFile = () => join(home(), "upgrades.json");
