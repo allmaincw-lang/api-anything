@@ -35,6 +35,10 @@ regexes = [
   '''^eyJhbGciOiJIUzI1NiJ9\.eyJzdWIiOiJhbm9uIn0\.YW5vbnltb3Vz$''',
   '''^eyJhbGciOiJIUzI1NiJ9\.eyJzdWIiOiIxMjM0In0\.c2lnbmF0dXJlXzEyMw$''',
   '''^eyJhbGciOiJIUzI1NiJ9\.eyJzdWIiOiJ1c2VyLTEifQ\.Zm9vYmFyYmF6cXV4$''',
+  # registry/test/worker.test.ts and test/share.test.ts: made-up x-api-key values the registry's and
+  # shareOps' live-value checks must refuse
+  '''^Zx81Kq0pLm2Nb7Vc$''',
+  '''^Zx9Qw8vLm7Kj6HgF5dS4aP3oI2uY1tRe$''',
   # sites/airbnb.json (and test/edge/learner-r2.test.ts): Airbnb's public web API key, the same
   # constant every visitor's browser sends as x-airbnb-api-key; the op lists it as `public`
   '''^d306zoyjsyarp7ifhu67rjxn52tv0t20$''',
