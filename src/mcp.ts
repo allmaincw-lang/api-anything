@@ -56,12 +56,17 @@ const WINDOW_MS = 10 * 60_000;
  */
 export const TOOL_NAME_MAX = 40;
 
-/** `<site>__<op>` in the characters every client accepts; a cut one ends in a hash of the whole, so two stay distinct. */
+/**
+ * `<site>__<op>` in the characters every client accepts. A lossy, separator-ambiguous or cut name
+ * starts with `_` (which no valid site does) and ends in a hash of the original pair.
+ */
 export function toolName(site: string, op: Pick<Operation, "name">): string {
   const name = `${site}__${op.name}`.replace(/[^a-zA-Z0-9_-]/g, "_");
-  if (name.length <= TOOL_NAME_MAX) return name;
+  const ambiguousSeparator =
+    site.includes("__") || op.name.includes("__") || site.endsWith("_") || op.name.startsWith("_");
+  if (name.length <= TOOL_NAME_MAX && name === `${site}__${op.name}` && !ambiguousSeparator) return name;
   const hash = createHash("sha256").update(`${site}\0${op.name}`).digest("hex").slice(0, 8);
-  return `${name.slice(0, TOOL_NAME_MAX - 9)}_${hash}`;
+  return `_${name.slice(0, TOOL_NAME_MAX - 10)}_${hash}`;
 }
 
 type JsonSchema = Record<string, unknown>;
