@@ -5,11 +5,12 @@
  * outcome. At most 20 a day. A candidate that needs the browser (minTier above 1) is skipped: plain HTTP
  * would fail it whether it works or not.
  */
+import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { cleanCall } from "./clean.js";
 import { loadSettings } from "./identity.js";
 import { registryRequest } from "./registry.js";
-import type { ServedSite, VerifyJob } from "./registry-api.js";
+import { type ServedSite, type VerifyJob, versionHashText } from "./registry-api.js";
 import { flushReports, outcomeOf, queueReport, withSignal } from "./report.js";
 import { home, readJson, safeName, withLock, writePrivate } from "./session.js";
 import { type Operation, parseSite } from "./spec.js";
@@ -35,18 +36,29 @@ function spend(now: Date): boolean {
   });
 }
 
-/** The candidate a job names, as the registry serves its site; not installed, and held to the shared rules. */
+/**
+ * The candidate a job names: the job's own copy when it hashes to the job's hash, else the version the
+ * registry serves for its site, which is only each op's best (a registry that sends no copy). Not
+ * installed, and held to the shared rules.
+ */
 async function candidate(
   job: VerifyJob,
   sites: Map<string, Promise<ServedSite>>,
   signal?: AbortSignal,
 ): Promise<{ site: string; op: Operation } | undefined> {
   const name = safeName(job.site);
-  if (!sites.has(name)) sites.set(name, registryRequest<ServedSite>(`/v1/sites/${name}`, { signal }));
-  const served = await sites.get(name)!;
-  const found = served.operations?.find((o) => o.hash === job.hash && o.operation?.name === job.op);
-  if (!found) return undefined;
-  const site = parseSite({ name, baseUrl: served.baseUrl, operations: [found.operation] });
+  let found: { baseUrl: string; operation: Operation } | undefined;
+  const sent = job.operation;
+  if (sent && job.baseUrl && createHash("sha256").update(versionHashText(name, sent)).digest("hex") === job.hash)
+    found = { baseUrl: job.baseUrl, operation: sent };
+  else {
+    if (!sites.has(name)) sites.set(name, registryRequest<ServedSite>(`/v1/sites/${name}`, { signal }));
+    const served = await sites.get(name)!;
+    const op = served.operations?.find((o) => o.hash === job.hash && o.operation?.name === job.op);
+    if (op) found = { baseUrl: served.baseUrl, operation: op.operation };
+  }
+  if (!found || found.operation.name !== job.op) return undefined;
+  const site = parseSite({ name, baseUrl: found.baseUrl, operations: [found.operation] });
   if (vetShared(site).errors.length) return undefined;
   return { site: name, op: site.operations[0]! };
 }

@@ -224,8 +224,9 @@ async function verifyJobs(c: Ctx) {
   const rows = await unverified(c.env.DB, key, limit * 5);
   const jobs: VerifyJob[] = rows
     .flatMap((r) => {
-      const args = exampleArgs(JSON.parse(r.operation) as Operation);
-      return args ? [{ hash: r.hash, site: r.site, op: r.op_name, args }] : [];
+      const operation = JSON.parse(r.operation) as Operation;
+      const args = exampleArgs(operation);
+      return args ? [{ hash: r.hash, site: r.site, op: r.op_name, args, operation, baseUrl: r.base_url }] : [];
     })
     .slice(0, limit);
   return json({ jobs });

@@ -1061,7 +1061,9 @@ local op with no version.
 
 **Background verification (`background.ts`).** An MCP server with `share` on that has seen no message
 in or out for 60 s asks `GET /v1/verify-jobs` (signed) for candidates this install has not reported,
-fetches each candidate's op from `GET /v1/sites/<site>` (matched by hash; not installed, held to the
+takes each candidate's op from the job, which carries the version and its site's `baseUrl` since
+`GET /v1/sites/<site>` serves only each op's best (used only when it hashes to the job's hash; a
+registry that sends none is asked `GET /v1/sites/<site>`, matched by hash; not installed, held to the
 shared rules), calls it with the job's args through `cleanCall` with `publicOnly` (https to public
 addresses only, every hop, as above), never with the user's sessions, and reports the outcome. A
 candidate with `minTier` above 1 is skipped: plain HTTP would fail it whether it works or not, and the

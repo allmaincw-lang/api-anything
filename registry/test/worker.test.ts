@@ -494,7 +494,12 @@ describe("maintenance by the crowd", () => {
     });
     assert.equal(fresh.body.status, "candidate", fresh.text);
 
-    const jobs = async () => (await send(env, "GET", "/v1/verify-jobs?limit=20", { as: me })).body.jobs;
+    const sent = async () => (await send(env, "GET", "/v1/verify-jobs?limit=20", { as: me })).body.jobs;
+    // each job carries its version and the site's baseUrl: /v1/sites serves only each op's best
+    const [job] = await sent();
+    assert.equal(job.baseUrl, "https://www.example.com");
+    assert.equal(createHash("sha256").update(versionHashText("example-com", job.operation)).digest("hex"), wanted);
+    const jobs = async () => (await sent()).map(({ operation: _o, baseUrl: _b, ...j }: Record<string, unknown>) => j);
     const want = { hash: wanted, site: "example-com", op: "wanted", args: { q: "dune", page: 1 } };
     assert.deepEqual(await jobs(), [want]);
     // the uploader's own friends on its network found nothing

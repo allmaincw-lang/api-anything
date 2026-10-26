@@ -47,6 +47,7 @@ beforeEach(() => {
   fake.received.length = 0;
   fake.down = false;
   fake.hang = false;
+  fake.abandoned = 0;
   dns.clear();
 });
 
@@ -390,6 +391,9 @@ test("reports are never sent with sharing off, and never hold a call or the exit
   const t0 = Date.now();
   await settle(300);
   assert.ok(Date.now() - t0 < 1500, "a registry that does not answer is given up on");
+  // and the report on its way is stopped, so it does not hold the process open until its timeout
+  for (let i = 0; i < 50 && !fake.abandoned; i++) await new Promise((r) => setTimeout(r, 20));
+  assert.equal(fake.abandoned, 1);
   fake.hang = false;
   fake.down = true;
   const down = await call("demo", "search", { q: "x" }, { maxTier: 1, minIntervalMs: 0, fetchImpl });
@@ -569,6 +573,35 @@ test("background verification calls each candidate with no cookies over plain HT
   sent.length = 0;
   assert.equal(await verifyCandidates({ fetchImpl, minIntervalMs: 0, now: new Date("2026-10-27T12:00:00Z") }), 0);
   assert.equal(sent.length, 0);
+});
+
+test("background verification checks the version a job names, even one its site does not serve as the op's best", async () => {
+  shareOn();
+  const best = site();
+  fake.sites.set("demo", served(best, undefined, "candidate"));
+  // a second candidate of the same op, ranked below the first: /v1/sites does not serve it
+  const other = site({ request: { method: "GET", url: "https://www.example.com/api/v2/search?q=x", headers: {} } });
+  const op = other.operations[0]!;
+  const hash = hashOf("demo", op);
+  const job = { hash, site: "demo", op: "search", args: { q: "kept" } };
+  const sent: string[] = [];
+  const fetchImpl = (async (input: string | URL | Request) => {
+    sent.push(String(input));
+    return json({ hits: [{ t: 1 }] });
+  }) as typeof fetch;
+  const now = new Date("2026-10-28T12:00:00Z");
+
+  fake.jobs = [{ ...job, operation: op, baseUrl: other.baseUrl }];
+  assert.equal(await verifyCandidates({ fetchImpl, minIntervalMs: 0, now }), 1);
+  assert.deepEqual(sent, ["https://www.example.com/api/v2/search?q=kept"]);
+  assert.deepEqual(fake.reports().at(-1), { hash, outcome: "ok", tier: 1, ms: fake.reports().at(-1)!.ms });
+
+  // a copy that does not hash to the job's hash is not used: the served site has no such version
+  sent.length = 0;
+  const tampered = { ...op, request: { ...op.request, url: "https://www.example.com/elsewhere?q=x" } };
+  fake.jobs = [{ ...job, operation: tampered, baseUrl: other.baseUrl }];
+  assert.equal(await verifyCandidates({ fetchImpl, minIntervalMs: 0, now }), 0);
+  assert.deepEqual(sent, []);
 });
 
 test("background verification stops when the client goes away", async () => {

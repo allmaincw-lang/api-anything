@@ -129,6 +129,9 @@ export interface VerifyJob {
   site: string;
   op: string;
   args: Record<string, unknown>;
+  /** the version itself, and its site's baseUrl: /v1/sites serves only each op's best version */
+  operation?: Operation;
+  baseUrl?: string;
 }
 
 /**

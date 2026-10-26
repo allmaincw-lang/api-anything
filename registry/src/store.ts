@@ -277,7 +277,8 @@ export async function unverified(db: D1Database, key: string, limit: number) {
   return (
     await db
       .prepare(
-        `SELECT v.hash, v.site, v.op_name, v.operation FROM versions v
+        `SELECT v.hash, v.site, v.op_name, v.operation, s.base_url FROM versions v
+        JOIN sites s ON s.name = v.site
         WHERE v.status = 'candidate' AND v.uploader <> ?
           AND COALESCE(json_extract(v.operation, '$.minTier'), 1) = 1
           AND NOT EXISTS (SELECT 1 FROM reports r WHERE r.hash = v.hash AND r.key = ?)
@@ -288,7 +289,7 @@ export async function unverified(db: D1Database, key: string, limit: number) {
         ORDER BY v.created_at LIMIT ?`,
       )
       .bind(key, key, limit)
-      .all<Pick<VersionRow, "hash" | "site" | "op_name" | "operation">>()
+      .all<Pick<VersionRow, "hash" | "site" | "op_name" | "operation"> & { base_url: string }>()
   ).results;
 }
 
