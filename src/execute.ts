@@ -27,8 +27,21 @@ import {
   profileDir,
   runOpTrigger,
 } from "./heal.js";
-import { BadHeader, buildRequest, holdsRef, nextHop, RedirectRefused, type Sent, send, withDefaults } from "./http.js";
+import {
+  AddressRefused,
+  BadHeader,
+  buildRequest,
+  holdsRef,
+  nextHop,
+  RedirectRefused,
+  refusePrivate,
+  refusePrivateHop,
+  type Sent,
+  send,
+  withDefaults,
+} from "./http.js";
 import { reimportIfBrowser } from "./login.js";
+import { afterCall } from "./report.js";
 import { redact } from "./secrets.js";
 import {
   dropUnbound,
@@ -46,6 +59,7 @@ import {
   lastHealAt,
   loadSite,
   markStale,
+  type Resolved,
   rememberedTier,
   rememberTier,
   settleWrite,
@@ -175,6 +189,50 @@ interface Ctx {
   maxTier: Tier;
   /** every attempt this call made, in order: what a write did is read from them */
   log: Attempt[];
+  /** the site's `shared` record: someone else wrote this spec (pulled, or a bundled one upgraded from the registry) */
+  shared?: Site["shared"];
+  /** `unconfirmed`: no browser run in the user's profile for it (tier 3, a recapture, a cookie refresh) */
+  unconfirmed?: boolean;
+}
+
+/**
+ * An unreviewed candidate an agent pulled: nobody but its uploader has seen it work, and page text may
+ * have steered the agent to it. It runs at tiers 1 and 2 only, never as a trigger run in the user's
+ * browser profile, whose steps click what the spec says with the user's sessions aboard. A human's pull
+ * (no `by: "agent"`) is the consent that lifts it, as for an agent pull's writes.
+ */
+const unconfirmed = (site: Site, op: Operation) => site.shared?.by === "agent" && op.version?.status === "candidate";
+
+/** The answer to a call of an `unconfirmed` op that needs tier 3. */
+const needsHuman = (site: string, notes: string[]): Result => ({
+  ok: false,
+  class: "blocked",
+  tier: 3,
+  reason: [
+    ...notes,
+    "needs tier 3 (the site's own page in the browser), and this is an unconfirmed operation an agent pulled: it never runs in the user's browser profile",
+  ].join("; "),
+  next: `the operation is unconfirmed and needs the browser: do not retry. A human can allow it: ask the user to look at the site's operations and, if they trust them, run in a terminal: api-anything pull ${site}`,
+  nextCall: { action: "report" },
+  retry: "after_fix",
+});
+
+const NO_SESSION: Session = { cookies: [], values: {} };
+
+/**
+ * Whether this op goes without the user's cookies and session values: a request that is no GET or HEAD,
+ * of a spec an agent pulled (page text may have steered it there), may change something whatever the
+ * spec says it is. A human's pull and a bundled spec upgraded from the registry keep them: the registry
+ * serves no such op to anyone but its uploader until a maintainer reviewed it (a POST read, a slot
+ * holding a cookie or session ref), and the seeded POST reads need theirs (airbnb search).
+ */
+function bare(ctx: Ctx, op: Operation): boolean {
+  // An unreviewed candidate is a public read by the registry's rules, so it needs no session; and a
+  // GET can do harm with the user's cookies too (a one-click account action), whoever pulled it.
+  if (ctx.shared && op.version?.status === "candidate") return true;
+  if (ctx.shared?.by !== "agent") return false;
+  const method = op.request.method.toUpperCase();
+  return method !== "GET" && method !== "HEAD";
 }
 
 /** What one attempt did to a write. */
@@ -380,7 +438,8 @@ async function tryTier(ctx: Ctx, op: Operation, tier: Tier): Promise<Attempt> {
       const stopped = run.repeats === 1 ? "the repeat was" : `${run.repeats} repeats were`;
       return { ...a, note: `the page sent this write ${run.repeats + 1} times: ${stopped} stopped in the browser` };
     }
-    const session = loadSession(ctx.site);
+    const none = bare(ctx, op);
+    const session = none ? NO_SESSION : loadSession(ctx.site);
     let r: Sent | PageFetchResult;
     if (tier === 1) {
       const sent = await send(op, ctx.args, session, {
@@ -388,6 +447,8 @@ async function tryTier(ctx: Ctx, op: Operation, tier: Tier): Promise<Attempt> {
         fetchImpl: ctx.opts.fetchImpl,
         timeoutMs: ctx.opts.timeoutMs,
         minIntervalMs: ctx.opts.minIntervalMs,
+        // someone else's spec sends only to public addresses; tiers 2 and 3 are the browser's, out of this guard's reach
+        publicOnly: !!ctx.shared,
       });
       // A rotating cookie (a rolling session, __cf_bm) must ride on the next call.
       if (sent.setCookies) {
@@ -400,6 +461,8 @@ async function tryTier(ctx: Ctx, op: Operation, tier: Tier): Promise<Attempt> {
       r = sent;
     } else {
       const req = buildRequest(op, ctx.args, session);
+      // someone else's spec: the page's fetch goes only to public addresses, as tier 1 does (tier 3 is not covered)
+      if (ctx.shared) await refusePrivate(op, req.url);
       const { cookie: _jar, ...headers } = req.headers; // the page sends the profile's own cookies
       r = await pageFetch({
         origin: new URL(req.url).origin,
@@ -410,8 +473,14 @@ async function tryTier(ctx: Ctx, op: Operation, tier: Tier): Promise<Attempt> {
         profileDir: profileDir(),
         timeoutMs: ctx.opts.timeoutMs,
         retryOnNavigation: op.readOnly,
+        // the page's own cookies, unless they may not go (`bare`)
+        ...(none ? { credentials: "omit" as const } : {}),
         // tier 1's policy, one hop at a time: a page's own fetch() would follow with everything aboard
-        redirect: (from, status, location, taken) => nextHop(op, session, from, status, location, taken),
+        redirect: async (from, status, location, taken) => {
+          const next = nextHop(op, session, from, status, location, taken);
+          if (ctx.shared) await refusePrivateHop(next, status);
+          return next;
+        },
       });
     }
     const j = judge(op, r);
@@ -428,6 +497,16 @@ async function tryTier(ctx: Ctx, op: Operation, tier: Tier): Promise<Attempt> {
   } catch (e) {
     // nothing was sent when the browser could not start
     if (e instanceof ProfileInUse) return { tier, class: "error", reason: e.message, hint: PROFILE_HINT, unsent: true };
+    // someone else's spec names an address on this machine or the local network: nothing was sent, and no tier sends it
+    if (e instanceof AddressRefused)
+      return {
+        tier,
+        class: "error",
+        reason: e.message,
+        unsent: true,
+        hint: "do not retry: the spec someone else wrote sends to an address that is not public; tell the user, and learn the site again with learn_site",
+        step: "report",
+      };
     if (e instanceof RedirectRefused) {
       // The redirect is the site's answer, so a retry meets it again; the request it answered was sent.
       const add = `api-anything add ${ctx.site} ${op.name} ...${op.readOnly ? "" : " --write"}`;
@@ -584,7 +663,8 @@ async function onDrift(ctx: Ctx, site: Site, op: Operation, a: Attempt): Promise
       validate: (candidate) => attempt(ctx, candidate, Math.min(a.tier, 2) as Tier),
       fetchImpl: ctx.opts.fetchImpl,
       loginCookies: site.loginCookies,
-      browser: ctx.maxTier > 1,
+      // a recapture runs the trigger in the user's profile
+      browser: ctx.maxTier > 1 && !ctx.unconfirmed,
     }),
   );
   if (h.outcome === "healed") return success(h.attempt, { healed: true });
@@ -628,7 +708,10 @@ async function onDrift(ctx: Ctx, site: Site, op: Operation, a: Attempt): Promise
   return fail(b, { reason: `${b.reason}; heal failed: ${h.reason}` });
 }
 
-function resolve(siteName: string, opName: string): { site: Site; op: Operation; theirs: boolean } | Result {
+function resolve(
+  siteName: string,
+  opName: string,
+): { site: Site; op: Operation; theirs: boolean; source: Resolved["source"] } | Result {
   let r: ReturnType<typeof loadSite>;
   try {
     r = loadSite(siteName);
@@ -660,7 +743,7 @@ function resolve(siteName: string, opName: string): { site: Site; op: Operation;
       next: `api-anything ops ${r.site.name}`,
     };
   // someone else's: pulled, bundled, or a heal's copy of a pulled one
-  return { site: r.site, op, theirs: r.source !== "user" || !!r.site.shared };
+  return { site: r.site, op, theirs: r.source !== "user" || !!r.site.shared, source: r.source };
 }
 
 /**
@@ -766,7 +849,13 @@ export async function call(
     if (f.reason) f.reason = hide(f.reason, sessions, true);
     if (f.next) f.next = hide(f.next, sessions);
     if (ledger) settleWrite(ledger, f.write ?? "may_have_applied", f);
-    return { ...f, ms: Date.now() - t0 };
+    const out = { ...f, ms: Date.now() - t0 };
+    if (resolved && "source" in found)
+      afterCall(siteName, resolved, found.source, out, {
+        fetchImpl: opts.fetchImpl,
+        minIntervalMs: opts.minIntervalMs,
+      });
+    return out;
   };
   const found = resolve(siteName, opName);
   if ("ok" in found) return done(found);
@@ -880,7 +969,16 @@ export async function call(
       return false;
     }
   };
-  const ctx: Ctx = { site: siteName, args, opts, maxTier: opts.maxTier ?? 3, log };
+  const capped = unconfirmed(site, op);
+  const ctx: Ctx = {
+    site: siteName,
+    args,
+    opts,
+    maxTier: capped ? (Math.min(opts.maxTier ?? 3, 2) as Tier) : (opts.maxTier ?? 3),
+    log,
+    shared: site.shared,
+    unconfirmed: capped,
+  };
   const remembered = rememberedTier(siteName, op.name);
   // A remembered escalation is a speed hint, not a requirement: under a lower cap, start at the op's own tier.
   let tier = Math.max(op.minTier, remembered !== undefined && remembered <= ctx.maxTier ? remembered : 1) as Tier;
@@ -890,6 +988,7 @@ export async function call(
   let examplesChecked = false;
   for (;;) {
     if (tier > ctx.maxTier) {
+      if (capped && tier === 3 && (opts.maxTier ?? 3) >= 3) return done(needsHuman(siteName, notes));
       return done({
         ok: false,
         class: "blocked",
@@ -966,7 +1065,8 @@ export async function call(
       if (tier === 3 || ctx.maxTier <= 1) return fail();
       if (authStep < 2) {
         authStep = 2;
-        if (await refreshCookies(ctx, op, tier)) continue;
+        // the profile's cookies into the jar: none of the user's session is touched for an unconfirmed op
+        if (!ctx.unconfirmed && (await refreshCookies(ctx, op, tier))) continue;
       }
       authStep = 3;
       // Session values (a bearer, a guest token) come from the site's own requests: a trigger run
@@ -1056,14 +1156,23 @@ export async function heal(
       retry: "no",
     });
   }
-  const ctx: Ctx = { site: siteName, args, opts, maxTier: opts.maxTier ?? 3, log };
+  const capped = unconfirmed(site, op);
+  const ctx: Ctx = {
+    site: siteName,
+    args,
+    opts,
+    maxTier: capped ? (Math.min(opts.maxTier ?? 3, 2) as Tier) : (opts.maxTier ?? 3),
+    log,
+    shared: site.shared,
+    unconfirmed: capped,
+  };
   const tier = Math.min(Math.max(op.minTier, rememberedTier(siteName, op.name) ?? 1), 2) as Tier;
   const h = await safeHeal(
     healOperation(siteName, op, args, {
       validate: (c) => attempt(ctx, c, tier),
       fetchImpl: opts.fetchImpl,
       loginCookies: site.loginCookies,
-      browser: ctx.maxTier > 1,
+      browser: ctx.maxTier > 1 && !capped,
     }),
   );
   if (h.outcome === "healed") return done(success(h.attempt, { healed: true }), { strategy: h.strategy });

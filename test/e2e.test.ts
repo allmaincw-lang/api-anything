@@ -293,6 +293,7 @@ describe("e2e", { skip: !browserAvailable() && "no Chromium browser installed" }
         "call_operation",
         "find_sites",
         "get_job",
+        "learn_site",
         "list_operations",
         "list_sites",
         "login",

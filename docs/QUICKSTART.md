@@ -1,60 +1,110 @@
 # Setup and demos
 
-Use Node 22.13 or newer. Install a Chromium browser if you want to learn operations or use the
-browser tier: Google Chrome by default, or Brave, Microsoft Edge, Chromium, Vivaldi, Arc — any
-Chromium executable works, and a non-default one is named with `API_ANYTHING_BROWSER` (a name
-like `brave`, or the path). The runtime is local: it needs no API Anything account, cloud
-service, or model key. Your coding agent supplies the reasoning when creating an operation.
+Use Node 22.13 or newer. A Chromium browser is needed to learn operations and for the browser
+tier: Google Chrome by default, or Brave, Microsoft Edge, Chromium, Vivaldi, Arc. Any Chromium
+executable works, and a non-default one is named with `API_ANYTHING_BROWSER` (a name like `brave`,
+or the path). Calling shared operations over plain HTTP needs no browser. There is no API Anything
+account and no model key: your agent supplies the reasoning when it learns an operation.
 
-## Install and check
-
-The shortest path is to paste this into your coding agent:
-`Set up API Anything for me: https://github.com/goodnight000/api-anything/blob/main/INSTALL.md`.
-[INSTALL.md](../INSTALL.md) lists the steps the agent follows. By hand:
+## Setup
 
 ```sh
-git clone https://github.com/goodnight000/api-anything.git
-cd api-anything
-npm ci
-npm install -g "$(npm pack --silent)"
-api-anything sites
-api-anything call hacker-news search query=sqlite
+npx -y api-anything setup
 ```
 
-The last command should return `ok: true`, `tier: 1`, and a list of stories. It does not need an
-account or a browser. `ok: false` includes a class, reason and next step. CLI failures exit nonzero.
-For a reproducible deployment, run `git checkout <commit>` before `npm ci` and update that pin
-only after testing. Packing first avoids an npm 11 global Git-install failure that omits build
-dependencies. The installed command contains built files and does not depend on keeping the clone.
-The package is not published to npm yet. npm must be allowed to run its `prepare` script.
+Setup connects the MCP server, `{"command":"npx","args":["-y","api-anything","mcp"]}`, to each agent
+it finds:
 
-To try a read without a global install, this path is also verified:
+| agent | how | skill |
+|---|---|---|
+| Claude Code | `claude mcp add --scope user api-anything -- npx -y api-anything mcp`, else `~/.claude.json` `mcpServers` | `~/.claude/skills/api-anything/SKILL.md` |
+| Codex | `codex mcp add api-anything -- npx -y api-anything mcp`, else `~/.codex/config.toml` `[mcp_servers.api-anything]` | `~/.agents/skills/api-anything/SKILL.md` |
+| Cursor | `~/.cursor/mcp.json` `mcpServers` | none |
+| Claude Desktop | `claude_desktop_config.json` `mcpServers` (macOS: `~/Library/Application Support/Claude/`, Linux: `~/.config/Claude/`, Windows: `%APPDATA%\Claude\`) | none |
+
+Cursor and Claude Desktop are apps that start with a minimal PATH, where an `npx` from nvm or
+Homebrew is not found. For those two, the entry names npx by its absolute path (the one on setup's
+PATH, else the one beside the node running setup) and sets `"env": {"PATH": "<node's directory>:/usr/bin:/bin"}`
+so npx finds node. After a Node upgrade that moves npx, delete that entry and run setup again.
+
+- An `api-anything` entry that is already there is left as it is, even when it differs (an older
+  `api-anything mcp` entry, or one with `--allow-writes`). Other entries are never changed.
+- A config file is copied to `<file>.bak-api-anything` before api-anything first edits it. An older
+  copy of the skill is backed up the same way, then replaced.
+- It checks for a Chromium browser, makes this install's key (`~/.api-anything/key.json`, mode 0600),
+  and asks whether to help build the shared catalog. The answer is kept in
+  `~/.api-anything/settings.json`; until it is given, nothing is shared or reported.
+
+Flags:
+
+| flag | does |
+|---|---|
+| `--dry-run` | prints what would change, and changes nothing |
+| `--yes` | answers the question yes without asking |
+| `--no-share` | answers it no |
+| `--agents claude-code,codex,cursor,claude-desktop` | connects these agents only, found or not |
+
+Without a terminal (an agent running it) and without `--yes` or `--no-share`, the question is not
+asked and nothing is shared. Running setup again changes only what is missing.
+
+Restart the agent, then check it:
 
 ```sh
-npx -y github:goodnight000/api-anything call hacker-news search query=sqlite
+npx -y api-anything call hacker-news search query=sqlite
 ```
 
-Use `github:goodnight000/api-anything#<commit>` with `npx` to pin a revision.
+The call should return `ok: true`, `tier: 1`, and a list of stories. It needs no account and no
+browser. `ok: false` carries a class, a reason and a next step, and the CLI exits nonzero.
 
-## Connect an agent
+Then ask the agent something like "What does Goodreads rate Piranesi?". It should call
+`find_sites`, then `call_operation`. For a site nobody shared, it calls `learn_site`.
 
-For Claude Code, after installing the CLI:
+To run from a checkout instead: `npm ci`, then `npm run cli -- <command>` (for example
+`npm run cli -- call hacker-news search query=sqlite`). An MCP client can run the checkout with
+`{"command":"npx","args":["tsx","<checkout>/src/cli.ts","mcp"]}`.
+
+## The tools an agent gets
+
+| tool | does |
+|---|---|
+| `find_sites` | searches the shared catalog and this machine's sites by words, a domain or a URL |
+| `list_operations` | an operation's params and returned fields, and the site's notes; fetches a shared site on first use |
+| `call_operation` | calls a read; fetches a shared site on first use |
+| `call_write_operation` | calls a write; only on a server started with `--allow-writes` |
+| `get_job` | the result of a call still running after about 25 s |
+| `learn_site` | learns, proves and shares a read nobody shared yet, and answers the user's request |
+| `list_sites`, `login` | what is installed; refresh a session the user imported |
+
+`api-anything mcp --no-learn` hides `learn_site`. An MCP client without a shell can call and learn
+reads; learning a write needs the CLI (`add --write`), run by an agent with a shell or by the user.
+
+## Learning an operation
+
+`learn_site` (CLI: `api-anything learn`) takes:
+
+- `trigger`: the page URL with `{param}` placeholders, such as `https://site.com/search?q={q}`;
+- `args`: the user's own values. Their answer comes back in `data`;
+- `args2` and `args3`: two other real values of the same kind, chosen by the agent. `args2` becomes
+  the operation's shared example; `args3` is a holdout call, kept as the operation's check;
+- optionally `site`, `op`, `intent` (what the operation is for, shared as its description), and the
+  agent's own choice of request and recipe: `pickRequest`, `extract`, `pick`, `html`, `embedded`.
+
+It loads the page with `args` and with `args2` and picks the request that carries the values, with
+the fields from an outline of its answer. It saves the operation with `args2` as its example, calls
+it with `args3`, and replays it once with no cookies. The result has `data`, the operation's
+`signature`, the `chosen` request and recipe with `alternatives`, the `proof`, and what was `shared`.
+When the pick is wrong, call it again with the result's `captures` (no browser) and a
+`pickRequest` or a recipe.
 
 ```sh
-claude mcp add --scope user api-anything -- api-anything mcp
-mkdir -p ~/.claude/skills/api-anything
-cp "$(npm root -g)/api-anything/skills/api-anything/SKILL.md" ~/.claude/skills/api-anything/
+api-anything learn 'https://lobste.rs/domains/{domain}' \
+  --args domain=github.com --args2 domain=arxiv.org --args3 domain=youtube.com
 ```
 
-For Codex:
+## Other clients and flags
 
-```sh
-codex mcp add api-anything -- api-anything mcp
-codex mcp get api-anything
-```
-
-For any other client, or when a client can't find `api-anything` or `node`, print its entry with
-absolute paths:
+`setup` covers Claude Code, Codex, Cursor and Claude Desktop. For any other client (Gemini CLI,
+VS Code), or when a client can't find `api-anything` or `node`, print its entry with absolute paths:
 
 ```sh
 api-anything mcp --print-config
@@ -67,27 +117,10 @@ them. A client started from the Dock or a menu may not get your shell's `PATH`, 
 `api-anything`, or a `node` installed with nvm, is not found there. `API_ANYTHING_HOME` and
 `API_ANYTHING_BROWSER` are copied into the entry when you have them set.
 
-Restart the agent session. Ask it to list API Anything sites, then search Hacker News for sqlite.
-It should discover `list_sites`, `find_sites`, `list_operations`, `call_operation`, `get_job` and
-`login`, and use `call_operation` with `site: "hacker-news"`, `op: "search"`,
-`args: {"query":"sqlite"}`. A server started with `--allow-writes` adds `call_write_operation`. See
-the [official MCP setup instructions](https://developers.openai.com/codex/mcp).
-
 `api-anything mcp --sites goodreads,hacker-news` also serves each operation of those sites as a tool
 of its own (`goodreads__searchBooks`), with its arguments' schema, so the agent skips
 `list_operations`. Each one adds to the tool list the client sends with every request, so name only
 the sites you use.
-
-For creating new operations, give the coding agent the installed skill:
-
-```sh
-mkdir -p ~/.agents/skills/api-anything
-cp "$(npm root -g)/api-anything/skills/api-anything/SKILL.md" ~/.agents/skills/api-anything/SKILL.md
-```
-
-Codex discovers skills under `~/.agents/skills`; existing installations may also use
-`~/.codex/skills`. See [official skill discovery](https://developers.openai.com/codex/skills).
-An MCP-only client can call operations but needs a shell-capable agent or a person to create them.
 
 ### Client timeouts
 

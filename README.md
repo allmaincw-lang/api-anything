@@ -46,9 +46,14 @@ One site, one model, a few dozen runs. [Method, raw numbers and limits](bench/RE
 
 **1. Paste this into Claude Code, Codex or another coding agent:**
 
-```text
-Set up API Anything for me: https://github.com/goodnight000/api-anything/blob/main/INSTALL.md
-```
+- finds the agents on your machine (Claude Code, Codex, Cursor, Claude Desktop) and connects the MCP
+  server to each, with the agent's own `mcp add` command where it has one. It adds the skill to the
+  agents that take skills. Other entries in their configs are left alone, and each file is backed
+  up to `<file>.bak-api-anything` before its first edit;
+- checks for a Chromium browser (Chrome, Brave, Edge, Chromium, Vivaldi, Arc). One is needed only to
+  learn sites; calling shared operations works without it;
+- makes this install's key (`~/.api-anything/key.json`). There is no account;
+- asks one question: help build the shared catalog? The default is yes. See [Sharing](#sharing).
 
 The agent checks for Node 22.13+, builds and installs the `api-anything` command, makes one call to
 prove it works, then connects the MCP server and the skill to itself.
@@ -79,13 +84,15 @@ happened (`class`), why (`reason`) and what to do next (`next`).
 
 <br>
 
-The package isn't on npm yet, so build it from a clone. Don't use `npm install -g github:...`:
-it fails under npm 11.
+`npx -y api-anything setup` (Node 22.13+) connects the MCP server, and the skill where the agent takes
+skills, to Claude Code, Codex, Cursor and Claude Desktop, and asks whether to help build the shared
+catalog. `--dry-run` prints what it would change. [For an agent installing it](INSTALL.md)
+
+To build from a clone instead (don't use `npm install -g github:...`: it fails under npm 11):
 
 ```sh
-git clone https://github.com/goodnight000/api-anything.git && cd api-anything
-npm ci && npm install -g "$(npm pack --silent)"
-api-anything call hacker-news search query=sqlite
+api-anything learn 'https://lobste.rs/domains/{domain}' \
+  --args domain=github.com --args2 domain=arxiv.org --args3 domain=youtube.com
 ```
 
 Then connect your agent:
@@ -156,7 +163,7 @@ Specs hold references like <code>cookie:ct0</code>. Logins come from the browser
 <td width="50%" valign="top">
 <picture><source media="(prefers-color-scheme: dark)" srcset="docs/media/feature-share-dark.svg"><img src="docs/media/feature-share-light.svg" width="48" alt=""></picture>
 <br><b>Share and pull specs</b><br>
-Pull what someone else learned. Publish yours as a pull request, after the same checks.
+Pull what someone else learned. Publish yours to the shared catalog, after the same checks.
 </td>
 </tr>
 </table>
@@ -168,7 +175,8 @@ Pull what someone else learned. Publish yours as a pull request, after the same 
 | tool | what it does |
 |---|---|
 | `list_sites` | the sites, with how many operations each has |
-| `find_sites` | search the shared registry by what you need, a domain or a URL |
+| `find_sites` | search the shared catalog by what you need, a domain or a URL |
+| `learn_site` | learn a read nobody shared yet from a page URL and three values, and answer with it |
 | `list_operations` | a site's operations, each with a JSON Schema of its args, and the site's notes; pulls a shared site it doesn't have yet, with its reads only |
 | `call_operation` | call a read; it never sends a write |
 | `call_write_operation` | call a write; exists only on a server started with `--allow-writes` |
@@ -248,6 +256,39 @@ no model and no browser. In another project, install the packed tarball from you
 
 </details>
 
+## Sharing
+
+Whether sharing is on or off, a search goes to the catalog: the words, domain or URL your agent passes
+to `find_sites`, and the name of a shared site it calls before this machine has it.
+
+With sharing on, this is what leaves your machine:
+
+- **Operations learned from public pages.** An operation is shared automatically only when it is a
+  read, it was learned signed out, and the replay with no cookies answered (with the data, or with
+  a bot wall such as Anubis or Cloudflare, which each caller's browser passes on its own). Its stored example is the
+  agent's second value and its check is the third, never the value you asked for. Cookies and tokens are
+  references in an operation (`cookie:name`), never their values, and a spec holding a live
+  credential is refused before it is saved. Checks you recorded with `api-anything check` and notes
+  you wrote in `<site>.md` are not sent without your yes.
+- **An operation that needed your login**, or one that may hold something of yours (an email address,
+  an id, a value typed into the page), is shared only after you say yes. The agent asks you (through the
+  MCP client's prompt where it supports one), shows you what it found, and the command it runs is
+  `api-anything publish <site> <op> --yes`.
+- **Reports.** After a call: which version of the operation ran, the outcome, the transport tier
+  and the time. No arguments and no data. Each report is signed by your install's anonymous key, so
+  the catalog can tell that the same install sent it, and when.
+- **Background checks.** An idle MCP server calls a few new operations a day (at most 20) with their
+  published examples, over plain HTTP with no cookies, and reports the outcome. These calls go from
+  your machine and IP address to sites other people's agents shared, and only to https addresses on
+  public hosts.
+- **Repairs.** When a call heals a public operation that drifted, the repaired version is shared.
+
+A new operation is a candidate until installs other than its uploader report it working from
+different networks; then it is served as live. Operations that write, that needed a login, or that
+send to another site's host are never promoted by reports. With sharing off
+(`api-anything setup --no-share`), nothing is shared or reported, and the catalog still works for
+reads. [How the catalog works](docs/REGISTRY.md)
+
 ## Teach it a new site
 
 Give it the page URL with a placeholder, and two example inputs:
@@ -294,9 +335,8 @@ search, book details, an author's books and reviews.
 
 ## Share specs
 
-Someone may have learned the site already. `search` looks through the registry (this repository's
-[`sites/`](sites/)) by what you need, a domain or a URL, and `pull` fetches a spec, checked against
-the shared rules first:
+Someone may have learned the site already. `search` looks through the shared catalog by what you
+need, a domain or a URL, and `pull` fetches a site, checked against the shared rules first:
 
 ```sh
 api-anything search book ratings        # or goodreads.com, or a page's URL
@@ -310,7 +350,7 @@ To share one, prove it, then publish it:
 api-anything check hn-demo links domain=arxiv.org --expect result  # confirmed on the site
 api-anything verify hn-demo                                         # pass, fail or inconclusive
 api-anything publish hn-demo                                        # preview only
-api-anything publish hn-demo --yes                                  # open the pull request
+api-anything publish hn-demo --yes                                  # upload, signed by this install
 ```
 
 <details>
@@ -318,12 +358,12 @@ api-anything publish hn-demo --yes                                  # open the p
 
 <br>
 
-- `publish` previews exactly what becomes public: the files, every host the spec sends to, and
-  anything that may be yours, such as an email or an account id. Nothing is sent until `--yes`.
+- `publish` previews exactly what each upload sends, every host the op sends to, and anything that
+  may be yours, such as an email or an account id. Nothing is sent until `--yes`.
 - It refuses a spec holding a live cookie or session value, a provider API key, an op whose recorded
   checks fail, and an op marked `unproven`.
-- The pull request carries what `verify` answered. A maintainer reviews it, CI runs the same rules
-  on every spec in `sites/`, and gitleaks scans every commit for secrets.
+- An upload carries what the client proved. A new op is a candidate until other installs confirm it,
+  and one that needed a login or writes is reviewed first ([how the catalog works](docs/REGISTRY.md)).
 - A param can declare an `enum`, a `min` or a `max`. A call outside them is `input`, and nothing is sent.
 - A pulled spec is someone else's: its writes still need `--allow-writes`, and it runs with your session.
 
@@ -413,6 +453,12 @@ their values, so a refreshed session works without re-learning anything.
 
 - It's a local tool, not a hosted API. It uses your machine, your network and your sessions.
 - It knows only the operations it was taught, not every feature of every site.
+- `learn_site` learns from one page load per value, from a URL template. A site whose data appears
+  only after clicks or typing, or only on in-app navigation, needs the CLI's `capture` and `add`
+  with `--steps` or `--soft-from`. It learns reads only.
+- A shared operation is someone else's work. Candidates are served marked as such until other
+  installs confirm them, and an operation that worked for others can still fail for you (a
+  different region, a block on your network).
 - Repair can fail. There's no CAPTCHA solving: if a site challenges real Chrome, you clear it by hand,
   and a challenge that doesn't clear is reported as `blocked`.
 - `verify` proves an op only as far as its examples and checks go: a few cases a human confirmed,
@@ -431,6 +477,7 @@ their values, so a refreshed session works without re-learning anything.
 | [Setup for agents](docs/QUICKSTART.md) | install, connect each client, timeouts, troubleshooting |
 | [Reference](docs/REFERENCE.md) | creating operations, replay and repair, logging in, safety, limits |
 | [Design](docs/DESIGN.md) | the authoritative spec, and the reasons behind it |
+| [Catalog](docs/REGISTRY.md) | the shared catalog: promotion, reports, what it stores and what it leaves open |
 | [Benchmark](bench/README.md) · [explorer](bench/explore/README.md) | how every number on this page was measured |
 | [Demos](docs/demos/README.md) | recorded terminal runs, with transcripts and tapes |
 | [Contributing](CONTRIBUTING.md) | add a site spec, run the checks |

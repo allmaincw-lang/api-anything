@@ -42,7 +42,7 @@ import {
 import type { Match, Operation, Paging, Param, ResponseSpec, Site, Slot, Trigger, Volatile } from "./spec.js";
 import { appendHeal, clearStale, loadSite, rememberTier, updateSite } from "./store.js";
 import type { CaptureResult, Exchange, TriggerStep } from "./types.js";
-import { pagingProblems, readbackProblems } from "./vet.js";
+import { notARead, pagingProblems, readbackProblems } from "./vet.js";
 
 export const profileDir = () => join(home(), "profile");
 
@@ -490,7 +490,12 @@ export interface AddInput {
   /** a read's paging, set on top of what the op had */
   paging?: Paging;
   fetchImpl?: typeof fetch;
+  /** learn_site's: refuse (`NotARead`) a learned request `notARead` refuses, before anything is sent or saved */
+  readsOnly?: boolean;
 }
+
+/** A request learn_site may not save as a read (`notARead`): nothing was sent and nothing saved. */
+export class NotARead extends Error {}
 
 /** What a param says about its values that no capture tells, kept when its op is learned again. */
 const KEPT = ["description", "pattern", "hint", "enum", "min", "max"] as const;
@@ -870,6 +875,11 @@ export async function addOperation(input: AddInput): Promise<AddResult> {
     throw new Error(
       `capture ${i.from2.id} was made with --write and intercepted request ${learned.exchange2.id} as a write: learning it needs --write`,
     );
+  const notRead = i.readsOnly && !i.write ? notARead(learned.operation) : undefined;
+  if (notRead)
+    throw new NotARead(
+      `request ${learned.exchange.id} (${learned.operation.request.method} ${learned.operation.request.url.split("?")[0]}) is not a read: ${notRead}`,
+    );
   const warnings = recipeWarnings(learned.warnings, r);
   if (missing.length)
     warnings.push(
@@ -1174,9 +1184,11 @@ function saveHealed(
       outcome: "failed",
       reason: `refusing to save a healed spec containing a credential: ${secrets.join("; ")}`,
     };
+  // a healed op is no longer the registry version it was; the heal-back (share.ts) may upload it as a new one
+  const { version: _v, ...healed } = op;
   updateSite(site, (current) => {
     if (!current) throw new Error(`site "${site}" disappeared during heal`);
-    return putOperation(current, op);
+    return putOperation(current, healed);
   });
   recordOrigins(site, opUrls(op));
   appendHeal({ site, op: op.name, strategy, diff });
@@ -1241,7 +1253,11 @@ export async function healOperation(
   }
   const tried = scanned ? swapped.replace("%s", last!.reason) : "rescan found nothing new";
   if (o.browser === false)
-    return { outcome: "failed", attempt: last, reason: `${tried}; recapture needs the browser (maxTier 1)` };
+    return {
+      outcome: "failed",
+      attempt: last,
+      reason: `${tried}; recapture needs the browser, which this call does not run (maxTier 1, or an unconfirmed operation an agent pulled)`,
+    };
   // nothing was learned about the op: once a browser is installed, the next call heals
   if (!browserAvailable())
     return {

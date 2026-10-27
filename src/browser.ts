@@ -1275,7 +1275,9 @@ export async function pageFetch(o: {
    * another origin with every header and the body. `taken`: the redirects before this one, for
    * the caller's limit. Without it no redirect is followed, and the redirect itself is the answer.
    */
-  redirect?: (from: Hop, status: number, location: string, taken: number) => Hop;
+  redirect?: (from: Hop, status: number, location: string, taken: number) => Hop | Promise<Hop>;
+  /** "omit": send none of the profile's cookies (someone else's spec, a request that may change something) */
+  credentials?: "include" | "omit";
 }): Promise<PageFetchResult> {
   const timeoutMs = o.timeoutMs ?? 30_000;
   const release = hold();
@@ -1294,12 +1296,12 @@ export async function pageFetch(o: {
       const onResponse = (res: Response) => void (res.status() >= 300 && res.status() < 400 && redirects.push(res));
       page.on("response", onResponse);
       const run = page.evaluate(
-        async ({ url, method, headers, body, left }) => {
+        async ({ url, method, headers, body, left, credentials }) => {
           const r = await fetch(url, {
             method,
             headers,
             body,
-            credentials: "include",
+            credentials,
             redirect: "manual",
             signal: AbortSignal.timeout(left),
           });
@@ -1310,7 +1312,7 @@ export async function pageFetch(o: {
           });
           return { opaque: false as const, status: r.status, headers: h, body: await r.text(), url: r.url };
         },
-        { ...hop, left },
+        { ...hop, left, credentials: o.credentials ?? ("include" as const) },
       );
       // the page itself can hang (a stuck renderer): the budget holds either way
       let timer: NodeJS.Timeout | undefined;
@@ -1409,7 +1411,7 @@ export async function pageFetch(o: {
         redirected ||= !!location;
         if (!location || !o.redirect)
           return { ...r, ms: Math.round(performance.now() - t0), ...(redirected ? { redirected } : {}) };
-        hop = o.redirect(hop, r.status, location, hops);
+        hop = await o.redirect(hop, r.status, location, hops);
       }
     } catch (e) {
       // a page a call failed on (a dead server, a stale document, a stall) is not handed to the next one

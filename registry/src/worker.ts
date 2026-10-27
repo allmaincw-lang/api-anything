@@ -1,0 +1,547 @@
+/** The registry Worker: the HTTP surface of src/registry-api.ts, the pages, and the daily archive. */
+import { z } from "zod";
+import type { Report, Status, UploadResult, VerifyJob } from "../../src/registry-api.js";
+import type { Operation } from "../../src/spec.js";
+import { networksOf, sha256Hex, signatureHeaders, signer } from "./auth.js";
+import { catalog, confirmed, entryOf, search } from "./catalog.js";
+import { CSP, homePage, sitemap, sitePage } from "./pages.js";
+import { nextStatus, type Thresholds, thresholds, toArchive } from "./rules.js";
+import {
+  addSite,
+  addVersion,
+  archive,
+  archiveCandidates,
+  archiveOldSeeds,
+  count,
+  type D1Database,
+  facts,
+  failedOn,
+  getKey,
+  getSite,
+  getVersion,
+  incumbentSig,
+  putReport,
+  reseed,
+  seedSite,
+  setStatus,
+  siteOps,
+  touchKey,
+  touchOk,
+  unverified,
+  type VersionRow,
+  versionsIn,
+} from "./store.js";
+import {
+  HASH,
+  matchSig,
+  nameRefusal,
+  parseOperation,
+  readUpload,
+  refusals,
+  reviewReasons,
+  SiteContextSchema,
+  versionHash,
+} from "./upload.js";
+
+export interface Env {
+  DB: D1Database;
+  ADMIN_TOKEN?: string;
+  SALT?: string;
+  /** thresholds (rules.ts), e.g. PROMOTE_KEYS */
+  [threshold: string]: unknown;
+}
+
+const DAY = 86_400_000;
+const HOUR = 3_600_000;
+const MAX_BODY = 256 * 1024;
+const MAX_SEED = 1024 * 1024;
+const MAX_REPORTS = 50;
+
+class HttpError extends Error {
+  constructor(
+    readonly status: number,
+    message: string,
+    readonly reasons?: string[],
+    readonly headers: Record<string, string> = {},
+  ) {
+    super(message);
+  }
+}
+
+const json = (body: unknown, status = 200, headers: Record<string, string> = {}) =>
+  new Response(JSON.stringify(body), {
+    status,
+    headers: { "content-type": "application/json; charset=utf-8", ...headers },
+  });
+
+const html = (body: string, status = 200) =>
+  new Response(body, {
+    status,
+    headers: {
+      "content-type": "text/html; charset=utf-8",
+      "content-security-policy": CSP,
+      "x-content-type-options": "nosniff",
+      "referrer-policy": "no-referrer",
+      "cache-control": "public, max-age=60",
+    },
+  });
+
+interface Ctx {
+  request: Request;
+  env: Env;
+  url: URL;
+  now: number;
+  t: Thresholds;
+  /** the start of the recent window, ISO */
+  since: string;
+  body: Uint8Array<ArrayBuffer>;
+}
+
+/** The body, read as a stream that stops at `max`: a declared length or a stream past it is a 413. */
+async function readBody(request: Request, max: number): Promise<Uint8Array<ArrayBuffer>> {
+  if (request.method === "GET" || request.method === "HEAD" || !request.body) return new Uint8Array();
+  const tooBig = () => new HttpError(413, `the body is over ${max / 1024} KB`);
+  if (Number(request.headers.get("content-length") ?? 0) > max) throw tooBig();
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    size += value.byteLength;
+    if (size > max) {
+      await reader.cancel();
+      throw tooBig();
+    }
+    chunks.push(value);
+  }
+  const body = new Uint8Array(size);
+  let at = 0;
+  for (const c of chunks) {
+    body.set(c, at);
+    at += c.byteLength;
+  }
+  return body;
+}
+
+function parseJson(body: Uint8Array): unknown {
+  try {
+    return JSON.parse(new TextDecoder().decode(body));
+  } catch {
+    throw new HttpError(400, "the body is not JSON");
+  }
+}
+
+const issues = (e: z.ZodError) => e.issues.map((i) => `${i.path.join(".") || "body"}: ${i.message}`);
+
+/** The key that signed the request; `required` refuses an unsigned one. A bad signature is always refused. */
+async function keyOf(c: Ctx, required: true): Promise<string>;
+async function keyOf(c: Ctx, required: false): Promise<string | undefined>;
+async function keyOf(c: Ctx, required: boolean): Promise<string | undefined> {
+  const s = await signer(c.request, c.body, c.now);
+  if (s && "error" in s) throw new HttpError(401, s.error);
+  if (!s && required) throw new HttpError(401, "this endpoint takes a signed request (x-aa-key, x-aa-ts, x-aa-sig)");
+  return s?.key;
+}
+
+function salt(c: Ctx): string {
+  if (!c.env.SALT) throw new HttpError(500, "the registry has no SALT set");
+  return c.env.SALT;
+}
+
+const tooMany = (message: string, until: number, now: number) =>
+  new HttpError(429, message, undefined, { "retry-after": String(Math.max(1, Math.ceil((until - now) / 1000))) });
+
+/**
+ * Counts `n` against the key's and the network's hourly budget for `kind`, and an upload against every
+ * key's together (the circuit breaker); past any, a 429. The breaker counts only what passed the others,
+ * so one refused key cannot spend everyone's budget.
+ */
+async function spend(c: Ctx, kind: "upload" | "report", key: string, prefix: string, n: number) {
+  const max = kind === "upload" ? c.t.uploadsPerHour : c.t.reportsPerHour;
+  const hour = Math.floor(c.now / HOUR);
+  const next = (hour + 1) * HOUR;
+  const byKey = await count(c.env.DB, `key:${key}`, kind, hour, n);
+  const byNet = await count(c.env.DB, `net:${prefix}`, kind, hour, n);
+  if (byKey > max || byNet > max) throw tooMany(`over ${max} ${kind}s an hour`, next, c.now);
+  if (kind === "upload" && (await count(c.env.DB, "all", kind, hour, n)) > c.t.uploadsPerHourAll)
+    throw tooMany(`the registry takes at most ${c.t.uploadsPerHourAll} uploads an hour; try later`, next, c.now);
+}
+
+/** A key first seen less than an hour ago uploads at most `newKeyUploads` versions. */
+async function newKeyLimit(c: Ctx, key: string) {
+  const row = await getKey(c.env.DB, key);
+  const seen = row ? Date.parse(row.first_seen) : c.now;
+  if (c.now - seen < HOUR && (row?.uploads ?? 0) >= c.t.newKeyUploads)
+    throw tooMany(`a key new this hour uploads at most ${c.t.newKeyUploads} versions`, seen + HOUR, c.now);
+}
+
+/** Applies what the version's reports now say to its status. */
+async function recompute(c: Ctx, v: VersionRow): Promise<Status> {
+  const weekAgo = new Date(c.now - 7 * DAY).toISOString();
+  const status = nextStatus(v.status, await facts(c.env.DB, v, c.since, c.t.degradeWindow, weekAgo), c.t);
+  if (status !== v.status) await setStatus(c.env.DB, v.hash, status, new Date(c.now).toISOString());
+  return status;
+}
+
+/* ------------------------------------------------------------------ reads */
+
+function searchApi(c: Ctx) {
+  const q = c.url.searchParams.get("q")?.trim();
+  if (!q) throw new HttpError(400, "search takes q: words, a domain or a URL");
+  const limit = Math.min(Math.max(Number(c.url.searchParams.get("limit")) || 5, 1), 20);
+  return keyOf(c, false)
+    .then((viewer) => catalog(c.env.DB, c.since, viewer))
+    .then((sites) => json({ matches: search(sites, q, limit) }));
+}
+
+async function siteApi(c: Ctx, name: string) {
+  const [site] = await catalog(c.env.DB, c.since, await keyOf(c, false), name);
+  if (!site) throw new HttpError(404, `no shared site ${name}`);
+  return json(site);
+}
+
+async function indexApi(c: Ctx) {
+  const sites = await catalog(c.env.DB, c.since, await keyOf(c, false));
+  return json({ generated: new Date(c.now).toISOString(), sites: sites.filter(confirmed).map(entryOf) });
+}
+
+/** The op's published example args, defaults filled; undefined when a required param has neither. */
+function exampleArgs(op: Operation): Record<string, unknown> | undefined {
+  const out: Record<string, unknown> = {};
+  for (const p of op.params) {
+    const v = p.example ?? p.default;
+    if (v !== undefined) out[p.name] = v;
+    else if (p.required) return undefined;
+  }
+  return out;
+}
+
+async function verifyJobs(c: Ctx) {
+  const key = await keyOf(c, true);
+  const limit = Math.min(Math.max(Number(c.url.searchParams.get("limit")) || 5, 1), 20);
+  // a candidate with no examples cannot be checked, so look past it
+  const rows = await unverified(c.env.DB, key, limit * 5);
+  const jobs: VerifyJob[] = rows
+    .flatMap((r) => {
+      const operation = JSON.parse(r.operation) as Operation;
+      const args = exampleArgs(operation);
+      return args ? [{ hash: r.hash, site: r.site, op: r.op_name, args, operation, baseUrl: r.base_url }] : [];
+    })
+    .slice(0, limit);
+  return json({ jobs });
+}
+
+/* ------------------------------------------------------------------ writes */
+
+/**
+ * Whether an upload claiming `healedFrom` is a heal, promoted by fewer installs: only of a version of the
+ * same op that is degraded, or live and failing for this very key in the last week. Otherwise anyone could
+ * name a live hash and take its op over.
+ */
+async function isHeal(c: Ctx, healedFrom: string | undefined, site: string, op: string, key: string) {
+  const from = healedFrom ? await getVersion(c.env.DB, healedFrom) : null;
+  if (!from || from.site !== site || from.op_name !== op) return false;
+  if (from.status === "degraded") return true;
+  return from.status === "live" && failedOn(c.env.DB, from.hash, key, new Date(c.now - 7 * DAY).toISOString());
+}
+
+async function upload(c: Ctx) {
+  const key = await keyOf(c, true);
+  const { network, prefix } = await networksOf(c.request, salt(c));
+  await newKeyLimit(c, key);
+  await spend(c, "upload", key, prefix, 1);
+  const now = new Date(c.now).toISOString();
+  await touchKey(c.env.DB, key, now, 1, 0);
+  const u = await readUpload(parseJson(c.body));
+  if ("errors" in u) throw new HttpError(422, "the version is refused", u.errors);
+  const db = c.env.DB;
+  const bound = await getSite(db, u.site.name);
+  if (bound && bound.domain !== u.site.domain)
+    throw new HttpError(409, "the version is refused", [`the name ${u.site.name} is bound to ${bound.domain}`]);
+  const squat = bound ? undefined : nameRefusal(u.site.name, u.site.domain);
+  if (squat) throw new HttpError(422, "the version is refused", [squat]);
+
+  const held = await getVersion(db, u.hash);
+  if (held) {
+    // the same version again: its uploader's confirmation
+    await db.batch([
+      putReport(db, { hash: u.hash, key, network, outcome: "ok", at: now }),
+      touchOk(db, u.hash, key, now),
+    ]);
+    const status = await recompute(c, held);
+    const reasons = held.reasons ? (JSON.parse(held.reasons) as string[]) : undefined;
+    return json({ hash: u.hash, status, duplicate: true, ...(reasons ? { reasons } : {}) } satisfies UploadResult);
+  }
+
+  const ops = await siteOps(db, u.site.name, u.site.domain);
+  const loginCookies = bound?.login_cookies ? (JSON.parse(bound.login_cookies) as string[]).length > 0 : false;
+  const incumbent = await incumbentSig(db, u.site.name, u.operation.name);
+  const reasons = reviewReasons(u.site, u.operation, u.evidence, {
+    opNames: ops.opNames,
+    login: loginCookies || ops.loginOp,
+    established: ops.established,
+    ...(incumbent ? { incumbentSig: incumbent } : {}),
+  });
+  const heal = await isHeal(c, u.evidence.healedFrom, u.site.name, u.operation.name, key);
+  const status: Status = reasons.length ? "review" : "candidate";
+  // an uploaded title could claim any brand: a site nobody seeded is titled by its domain
+  await addSite(db, { ...u.site, displayName: u.site.domain }, key, now);
+  await addVersion(
+    db,
+    {
+      hash: u.hash,
+      site: u.site.name,
+      operation: u.operation,
+      sig: matchSig(u.operation),
+      ...(u.parent ? { parent: u.parent } : {}),
+      heal,
+      status,
+      reasons,
+      uploader: key,
+      uploaderNetwork: network,
+      evidence: u.evidence,
+    },
+    now,
+  );
+  return json(
+    { hash: u.hash, status, duplicate: false, ...(reasons.length ? { reasons } : {}) } satisfies UploadResult,
+    201,
+  );
+}
+
+const ReportSchema = z.object({
+  hash: HASH,
+  outcome: z.enum(["ok", "fail", "wrong", "auth", "blocked", "rate", "input", "error"]),
+  tier: z.union([z.literal(1), z.literal(2), z.literal(3)]).optional(),
+  ms: z.number().int().min(0).max(3_600_000).optional(),
+});
+
+async function reports(c: Ctx) {
+  const key = await keyOf(c, true);
+  const raw = parseJson(c.body);
+  const list = z
+    .array(ReportSchema)
+    .max(MAX_REPORTS)
+    .safeParse(Array.isArray(raw) ? raw : (raw as { reports?: unknown } | null)?.reports);
+  if (!list.success)
+    throw new HttpError(400, `the body is { reports: Report[] }, at most ${MAX_REPORTS}`, issues(list.error));
+  const { network, prefix } = await networksOf(c.request, salt(c));
+  await spend(c, "report", key, prefix, list.data.length);
+  const db = c.env.DB;
+  const now = new Date(c.now).toISOString();
+  const versions = new Map((await versionsIn(db, [...new Set(list.data.map((r) => r.hash))])).map((v) => [v.hash, v]));
+  const known: Report[] = list.data.filter((r) => versions.has(r.hash));
+  if (known.length)
+    await db.batch(
+      known.flatMap((r) => [
+        putReport(db, { ...r, key, network, at: now }),
+        ...(r.outcome === "ok" ? [touchOk(db, r.hash, key, now)] : []),
+      ]),
+    );
+  for (const v of versions.values()) await recompute(c, v);
+  await touchKey(db, key, now, 0, known.length);
+  return json({ accepted: known.length, ignored: list.data.length - known.length });
+}
+
+/* ------------------------------------------------------------------ admin */
+
+async function admin(request: Request, env: Env) {
+  const token = env.ADMIN_TOKEN;
+  const given = request.headers.get("authorization") ?? "";
+  // compared as digests, so the time taken says nothing about the token
+  if (!token || (await sha256Hex(given)) !== (await sha256Hex(`Bearer ${token}`)))
+    throw new HttpError(403, "this endpoint takes the maintainer's token");
+}
+
+const STATUSES = ["candidate", "live", "degraded", "review", "archived", "blocked"] as const;
+
+async function adminVersion(c: Ctx, hash: string) {
+  const r = z.object({ status: z.enum(STATUSES) }).safeParse(parseJson(c.body));
+  if (!r.success) throw new HttpError(400, `the body is { status: ${STATUSES.join(" | ")} }`, issues(r.error));
+  if (!(await getVersion(c.env.DB, hash))) throw new HttpError(404, `no version ${hash}`);
+  await setStatus(c.env.DB, hash, r.data.status, new Date(c.now).toISOString());
+  return json({ hash, status: r.data.status });
+}
+
+async function adminSeed(c: Ctx) {
+  const r = z.object({ site: SiteContextSchema, operations: z.array(z.unknown()).min(1) }).safeParse(parseJson(c.body));
+  if (!r.success)
+    throw new HttpError(400, "the body is { site: SiteContext, operations: Operation[] }", issues(r.error));
+  const site = r.data.site;
+  const ops: Operation[] = [];
+  for (const raw of r.data.operations) {
+    const p = parseOperation(raw);
+    if ("errors" in p) throw new HttpError(422, "the seed is refused", p.errors);
+    ops.push(p.op);
+  }
+  const refused = refusals(site, ops);
+  if (refused.length) throw new HttpError(422, "the seed is refused", refused);
+  const db = c.env.DB;
+  const now = new Date(c.now).toISOString();
+  await seedSite(db, site, now);
+  const out: { name: string; hash: string; status: Status }[] = [];
+  for (const op of ops) {
+    const hash = await versionHash(site.name, op);
+    const held = await getVersion(db, hash);
+    if (held) await reseed(db, hash, now);
+    else
+      await addVersion(
+        db,
+        {
+          hash,
+          site: site.name,
+          operation: op,
+          sig: matchSig(op),
+          heal: false,
+          status: "live",
+          reasons: [],
+          uploader: "seed",
+          evidence: { clientVersion: "seed", learnedLoggedIn: op.learnedLoggedIn, cleanReplay: "skipped" },
+        },
+        now,
+      );
+    out.push({ name: op.name, hash, status: held?.status === "blocked" ? "blocked" : "live" });
+  }
+  await archiveOldSeeds(
+    db,
+    site.name,
+    out.map((o) => o.hash),
+    now,
+  );
+  return json({ site: site.name, operations: out });
+}
+
+/* ------------------------------------------------------------------ pages */
+
+async function home(c: Ctx) {
+  const sites = await catalog(c.env.DB, c.since);
+  const q = c.url.searchParams.get("q")?.trim();
+  // a site nobody but its uploader vouched for may say it is any brand: it is reached by name or domain only
+  if (!q) return html(homePage(sites.filter(confirmed), c.url.origin));
+  const byName = new Map(sites.map((s) => [s.name, s]));
+  const found = search(sites, q, 20).map((m) => byName.get(m.name)!);
+  return html(homePage(found, c.url.origin, q));
+}
+
+async function landing(c: Ctx, name: string) {
+  const [site] = await catalog(c.env.DB, c.since, undefined, name);
+  if (!site) return html(homePage([], c.url.origin, name), 404);
+  return html(sitePage(site, c.url.origin));
+}
+
+async function sitemapXml(c: Ctx) {
+  const sites = await catalog(c.env.DB, c.since);
+  return new Response(
+    sitemap(
+      sites.filter(confirmed).map((s) => s.name),
+      c.url.origin,
+    ),
+    { headers: { "content-type": "application/xml; charset=utf-8" } },
+  );
+}
+
+/* ------------------------------------------------------------------ routing */
+
+type Handler = (c: Ctx, param: string) => Promise<Response>;
+/** What a route takes before its body is read: a signature, the maintainer's token, or nothing. */
+type Auth = "signed" | "admin" | undefined;
+const NAME = "([a-z0-9][a-z0-9._-]{0,63})";
+const ROUTES: [method: string, path: RegExp, handler: Handler, auth?: Auth, maxBody?: number][] = [
+  ["GET", /^\/v1\/search$/, searchApi],
+  ["GET", new RegExp(`^/v1/sites/${NAME}$`), siteApi],
+  ["GET", /^\/v1\/index$/, indexApi],
+  ["GET", /^\/v1\/verify-jobs$/, verifyJobs, "signed"],
+  ["POST", /^\/v1\/versions$/, upload, "signed"],
+  ["POST", /^\/v1\/reports$/, reports, "signed"],
+  ["POST", /^\/v1\/admin\/versions\/([0-9a-f]{64})$/, adminVersion, "admin"],
+  ["POST", /^\/v1\/admin\/seed$/, adminSeed, "admin", MAX_SEED],
+  ["GET", /^\/$/, home],
+  ["GET", new RegExp(`^/sites/${NAME}/?$`), landing],
+  ["GET", /^\/sitemap\.xml$/, sitemapXml],
+];
+
+async function route(request: Request, env: Env, now: number): Promise<Response> {
+  const url = new URL(request.url);
+  const matches = ROUTES.flatMap(([method, re, handler, auth, max]) => {
+    const m = re.exec(url.pathname);
+    return m ? [{ method, handler, auth, max, param: m[1] ?? "" }] : [];
+  });
+  if (!matches.length) throw new HttpError(404, `no route ${url.pathname}`);
+  // a HEAD is answered as its GET; the runtime drops the body
+  const hit = matches.find((m) => m.method === (request.method === "HEAD" ? "GET" : request.method));
+  if (!hit) throw new HttpError(405, `${url.pathname} takes ${matches.map((m) => m.method).join(", ")}`);
+  // refused before a byte of the body is read
+  const sig = signatureHeaders(request.headers, now);
+  if (sig && "error" in sig) throw new HttpError(401, sig.error);
+  if (hit.auth === "signed" && !sig)
+    throw new HttpError(401, "this endpoint takes a signed request (x-aa-key, x-aa-ts, x-aa-sig)");
+  if (hit.auth === "admin") await admin(request, env);
+  const t = thresholds(env);
+  const body = await readBody(request, hit.max ?? MAX_BODY);
+  const since = new Date(now - t.recentDays * DAY).toISOString();
+  return hit.handler({ request, env, url, now, t, since, body }, hit.param);
+}
+
+/** The Workers Cache API's default cache, absent outside Workers (tests may stand one in). */
+interface EdgeCache {
+  match(request: Request): Promise<Response | undefined>;
+  put(request: Request, response: Response): Promise<void>;
+}
+const edgeCache = () => (globalThis as { caches?: { default?: EdgeCache } }).caches?.default;
+
+/** Public reads, the same for every unsigned caller: cached 60 s by URL. */
+const CACHED = new RegExp(`^/(v1/search|v1/sites/${NAME}|v1/index|sites/${NAME}/?|sitemap\\.xml)?$`);
+const CACHE_SECONDS = 60;
+
+function cacheable(request: Request): boolean {
+  if (request.method !== "GET") return false;
+  // a signed read may hold the signer's own review versions
+  if (["x-aa-key", "x-aa-ts", "x-aa-sig"].some((h) => request.headers.has(h))) return false;
+  return CACHED.test(new URL(request.url).pathname);
+}
+
+async function answer(request: Request, env: Env): Promise<Response> {
+  try {
+    return await route(request, env, Date.now());
+  } catch (e) {
+    if (e instanceof HttpError)
+      return json({ error: e.message, ...(e.reasons ? { reasons: e.reasons } : {}) }, e.status, e.headers);
+    console.error(e);
+    return json({ error: "the registry failed on this request" }, 500);
+  }
+}
+
+export default {
+  async fetch(request: Request, env: Env, ctx?: { waitUntil(p: Promise<unknown>): void }): Promise<Response> {
+    const cache = cacheable(request) ? edgeCache() : undefined;
+    const key = new Request(request.url, { method: "GET" });
+    const hit = await cache?.match(key);
+    if (hit) return hit;
+    const res = await answer(request, env);
+    if (!cache || res.status !== 200) return res;
+    res.headers.set("cache-control", `public, max-age=${CACHE_SECONDS}`);
+    const put = cache.put(key, res.clone());
+    if (ctx) ctx.waitUntil(put);
+    else await put;
+    return res;
+  },
+
+  /**
+   * The daily job: archive stale candidates and degraded versions, and degraded versions a newer live one
+   * replaced; delete what was archived over 30 days ago, with its reports.
+   */
+  async scheduled(controller: { scheduledTime: number }, env: Env): Promise<void> {
+    const now = controller.scheduledTime;
+    const cutoff = new Date(now - thresholds(env).recentDays * DAY).toISOString();
+    const gone = toArchive(await archiveCandidates(env.DB), cutoff);
+    await archive(
+      env.DB,
+      gone.map((v) => v.hash),
+      new Date(now).toISOString(),
+      Math.floor(now / HOUR),
+      new Date(now - 30 * DAY).toISOString(),
+    );
+    console.log(`archived ${gone.length} versions`);
+  },
+};

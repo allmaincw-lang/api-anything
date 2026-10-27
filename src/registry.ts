@@ -1,72 +1,101 @@
 /**
- * Sharing specs through the registry: this repository's `sites/` on GitHub. `pull` fetches one into
- * `~/.api-anything/registry`, `publish` opens a pull request adding one; the rules both apply are vet.ts's.
+ * The client of the registry service (docs/REGISTRY.md; the wire contract is registry-api.ts): `pull`
+ * fetches a site into `~/.api-anything/registry`, `search` asks which sites answer a query. The rules
+ * a pulled spec must pass are vet.ts's.
  */
 import { createHash } from "node:crypto";
-import { readdirSync, readFileSync, rmSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { join } from "node:path";
-import { parse } from "tldts";
 import { z } from "zod";
-import { returnedFields } from "./extract.js";
-import { dropUnbound, loadSession, safeName, siteOf, writePrivate } from "./session.js";
-import { type Operation, parseSite, type Site } from "./spec.js";
+import { loadSettings, signedHeaders } from "./identity.js";
+import { REGISTRY_API, type ServedSite, type Status } from "./registry-api.js";
+import { indexEntry, score, summarize } from "./search.js";
+import { dropUnbound, home, loadSession, readJson, safeName, siteOf, writePrivate } from "./session.js";
+import { parseSite, type Site } from "./spec.js";
 import { listSites, loadSite, registryDir, updateSite } from "./store.js";
 import { LIMITS, vetShared } from "./vet.js";
 
-/** The GitHub repository whose `sites/` is the registry. */
-export const REPO = "goodnight000/api-anything";
-export const REGISTRY = `https://raw.githubusercontent.com/${REPO}/main`;
-/** The registry's index and site pages, which CI builds from main and serves on GitHub Pages. */
-export const PAGES = "https://goodnight000.github.io/api-anything";
+export { summarize };
+
 const LOCAL = new Set(["localhost", "127.0.0.1", "[::1]"]);
 
 /** The registry's base URL: `API_ANYTHING_REGISTRY`, https (or http to this machine, for tests). */
 export function registryBase(): string {
-  const base = (process.env.API_ANYTHING_REGISTRY || REGISTRY).replace(/\/+$/, "");
+  const base = (process.env.API_ANYTHING_REGISTRY || REGISTRY_API).replace(/\/+$/, "");
   const u = new URL(base);
   if (u.protocol !== "https:" && !(u.protocol === "http:" && LOCAL.has(u.hostname)))
     throw new Error(`API_ANYTHING_REGISTRY must be https: ${base}`);
   return base;
 }
 
-/** The body of `url`, or undefined on a 404. Read while streaming, so a huge answer stops at `cap`. */
-async function fetchCapped(url: string, cap: number, fetchImpl: typeof fetch): Promise<string | undefined> {
-  // a redirect could move the fetch to any origin; the registry's files are served where they are
-  const res = await fetchImpl(url, { redirect: "error", signal: AbortSignal.timeout(20_000) });
-  if (res.status === 404) return undefined;
-  if (!res.ok) throw new Error(`${url} answered ${res.status}`);
+export class RegistryError extends Error {
+  constructor(
+    message: string,
+    readonly status?: number,
+  ) {
+    super(message);
+  }
+}
+
+/**
+ * One request to the registry, answered with JSON: no redirects (one could move it to any origin), a
+ * timeout, the answer read while streaming so a huge one stops at `cap`. `signed` adds identity.ts's headers.
+ */
+export async function registryRequest<T>(
+  path: string,
+  o: {
+    method?: "GET" | "POST";
+    body?: unknown;
+    signed?: boolean;
+    cap?: number;
+    timeoutMs?: number;
+    signal?: AbortSignal;
+  } = {},
+): Promise<T> {
+  const url = `${registryBase()}${path}`;
+  const method = o.method ?? "GET";
+  const text = o.body === undefined ? "" : JSON.stringify(o.body);
+  const u = new URL(url);
+  const timeout = AbortSignal.timeout(o.timeoutMs ?? 20_000);
+  const res = await fetch(url, {
+    method,
+    headers: {
+      ...(o.body !== undefined ? { "content-type": "application/json" } : {}),
+      ...(o.signed ? signedHeaders(method, u.pathname + u.search, text) : {}),
+    },
+    ...(o.body !== undefined ? { body: text } : {}),
+    redirect: "error",
+    signal: o.signal ? AbortSignal.any([timeout, o.signal]) : timeout,
+  }).catch((e: Error) => {
+    throw new RegistryError(`${url} could not be reached (${e.message})`);
+  });
+  const cap = o.cap ?? 1024 * 1024;
   const chunks: Uint8Array[] = [];
   let size = 0;
   for await (const chunk of res.body ?? []) {
     size += chunk.byteLength;
-    if (size > cap) throw new Error(`${url} is over ${cap} bytes`);
+    if (size > cap) throw new RegistryError(`${url} is over ${cap} bytes`, res.status);
     chunks.push(chunk);
   }
-  return Buffer.concat(chunks).toString("utf8");
-}
-
-const hostsOf = (op: Operation) => {
-  const urls = [op.request.url, op.trigger.url, op.trigger.softFrom];
-  return [...new Set(urls.flatMap((u) => (u ? [new URL(u).hostname] : [])))];
-};
-
-/** One op as the person deciding whether to run it needs to see it. */
-export function summarize(op: Operation) {
-  const fields = returnedFields(op.response);
-  return {
-    op: `${op.name}(${op.params.map((p) => `${p.name}${p.required ? "" : "?"}`).join(", ")})${fields ? ` -> ${fields.join(", ")}` : ""}`,
-    method: op.request.method.toUpperCase(),
-    hosts: hostsOf(op),
-    ...(op.readOnly ? {} : { write: true as const }),
-    ...(op.learnedLoggedIn ? { login: true as const } : {}),
-  };
+  let body: unknown;
+  try {
+    body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+  } catch {
+    throw new RegistryError(`${url} answered ${res.status}, not JSON`, res.status);
+  }
+  if (!res.ok) {
+    const e = body as { error?: unknown; reasons?: unknown };
+    const why = [e.error, ...(Array.isArray(e.reasons) ? e.reasons : [])].filter((x) => typeof x === "string");
+    throw new RegistryError(`${url} answered ${res.status}${why.length ? `: ${why.join("; ")}` : ""}`, res.status);
+  }
+  return body as T;
 }
 
 export interface Pulled {
   site: string;
   from: string;
   sha256: string;
-  operations: ReturnType<typeof summarize>[];
+  operations: (ReturnType<typeof summarize> & { status?: string })[];
   warnings: string[];
   /** on a pull again: ops that are new, changed or gone since the last one */
   changed?: { added: string[]; changed: string[]; removed: string[] };
@@ -82,28 +111,53 @@ const sitesOfSession = (name: string) => {
   ]);
 };
 
+/** A served site as a local spec: each op records the version it is. */
+function siteFrom(name: string, served: ServedSite): Site {
+  if (String(served.name).toLowerCase() !== name) throw new Error(`is the site "${served.name}", not "${name}"`);
+  const site = parseSite({
+    name,
+    ...(served.displayName ? { displayName: served.displayName } : {}),
+    baseUrl: served.baseUrl,
+    ...(served.description ? { description: served.description } : {}),
+    ...(served.loginCookies ? { loginCookies: served.loginCookies } : {}),
+    operations: served.operations.map((o) => ({ ...o.operation, version: { hash: o.hash, status: o.status } })),
+  });
+  if (siteOf(new URL(site.baseUrl).hostname) !== served.domain)
+    throw new Error(`names the domain ${served.domain}, and its baseUrl is ${site.baseUrl}`);
+  return site;
+}
+
 /**
  * `by: "agent"` marks a pull an agent made over MCP rather than one a human ran: its writes stay hidden
  * there whatever the server allows, since page text may have steered the agent to it.
  */
-export async function pull(name: string, o: { fetchImpl?: typeof fetch; by?: "agent" } = {}): Promise<Pulled> {
+export async function pull(name: string, o: { by?: "agent"; signal?: AbortSignal } = {}): Promise<Pulled> {
   name = safeName(name);
-  const fetchImpl = o.fetchImpl ?? fetch;
-  const from = `${registryBase()}/sites/${name}.json`;
-  const text = await fetchCapped(from, LIMITS.file, fetchImpl);
-  if (text === undefined) throw new Error(`no shared spec for "${name}" in the registry`);
+  const from = `${registryBase()}/v1/sites/${name}`;
+  let served: ServedSite;
+  try {
+    // the spec, its notes and the served fields around them
+    served = await registryRequest<ServedSite>(`/v1/sites/${name}`, {
+      cap: LIMITS.file + LIMITS.notes + 64 * 1024,
+      signal: o.signal,
+    });
+  } catch (e) {
+    if (e instanceof RegistryError && e.status === 404) throw new Error(`no shared spec for "${name}" in the registry`);
+    throw e;
+  }
   let site: Site;
   try {
-    site = parseSite(JSON.parse(text));
+    site = siteFrom(name, served);
   } catch (e) {
     throw new Error(`${from}: ${(e as Error).message}`);
   }
-  if (site.name.toLowerCase() !== name) throw new Error(`${from} is the spec of "${site.name}", not "${name}"`);
-  const sha256 = createHash("sha256").update(text).digest("hex");
-  site = { ...site, name, shared: { from, sha256, ...(o.by ? { by: o.by } : {}) } };
-  const notes = await fetchCapped(`${registryBase()}/sites/${name}.md`, LIMITS.notes, fetchImpl);
+  const notes = typeof served.notes === "string" ? served.notes : undefined;
   const { errors, warnings } = vetShared(site, notes);
   if (errors.length) throw new Error(`the shared spec of "${name}" fails the shared rules: ${errors.join("; ")}`);
+  const body = JSON.stringify(site, null, 2);
+  if (Buffer.byteLength(body) > LIMITS.file) throw new Error(`${from} is over ${LIMITS.file} bytes`);
+  const sha256 = createHash("sha256").update(body).digest("hex");
+  site = { ...site, shared: { from, sha256, ...(o.by ? { by: o.by } : {}) } };
 
   // One name is one session: a spec on another site would inherit this one's cookies and values.
   const own = siteOf(new URL(site.baseUrl).hostname);
@@ -137,7 +191,10 @@ export async function pull(name: string, o: { fetchImpl?: typeof fetch; by?: "ag
     site: name,
     from,
     sha256,
-    operations: site.operations.map(summarize),
+    operations: site.operations.map((op) => ({
+      ...summarize(op),
+      ...(op.version ? { status: op.version.status } : {}),
+    })),
     warnings,
     ...(before ? { changed: changes(before, site) } : {}),
     ...(local?.source === "user" ? { shadowedBy: local.path } : {}),
@@ -154,205 +211,208 @@ function changes(before: Site, after: Site) {
   };
 }
 
-/* ------------------------------------------------------------------ index and search */
+const upgradesFile = () => join(home(), "upgrades.json");
+const RETRY_UPGRADE_MS = 7 * 24 * 60 * 60_000;
 
-// The index reaches the agent as text, so it is held to the limits the shared rules put on a spec.
+/**
+ * A bundled site called with sharing on is replaced by the registry's copy, once, so its calls carry a
+ * version and report. No agent mark: the package already trusted the site. An attempt is recorded, so a
+ * registry without the site is asked again only after a week.
+ */
+export async function upgradeBundled(name: string, o: { signal?: AbortSignal } = {}): Promise<boolean> {
+  name = safeName(name);
+  if (!loadSettings().share || loadSite(name)?.source !== "bundled") return false;
+  const tried = readJsonOr<Record<string, number>>(upgradesFile(), {});
+  if (Date.now() - (tried[name] ?? 0) < RETRY_UPGRADE_MS) return false;
+  writePrivate(upgradesFile(), JSON.stringify({ ...tried, [name]: Date.now() }));
+  await pull(name, { signal: o.signal });
+  return true;
+}
+
+function readJsonOr<T>(file: string, fallback: T): T {
+  try {
+    return readJson<T>(file, fallback) ?? fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+/* ------------------------------------------------------------------ search */
+
+// A match reaches the agent as text, so it is held to the limits the shared rules put on a spec.
 const text = z.string().max(LIMITS.text);
-const HOST = z.string().regex(/^[a-z0-9.-]{1,253}$/);
-const IndexOpSchema = z.object({
-  // a signature: `name(params) -> fields`, whose name the shared rules restrict
-  op: z
+const NAME = /^[A-Za-z][A-Za-z0-9_.-]{0,63}$/;
+const STATUS = z.enum(["candidate", "live", "degraded", "review", "archived", "blocked"]);
+const FoundOpSchema = z.object({
+  name: z.string().regex(NAME),
+  // `name(params) -> fields`, whose name the shared rules restrict
+  signature: z
     .string()
     .max(2000)
     .regex(/^[A-Za-z][A-Za-z0-9_.-]{0,63}\(/),
-  method: z.string().regex(/^[A-Z]{1,10}$/),
-  hosts: z.array(HOST).max(20),
-  write: z.literal(true).optional(),
-  login: z.literal(true).optional(),
   description: text.optional(),
+  status: STATUS,
+  confirmations: z.number().int().min(0),
+  successRate: z.number().min(0).max(1).optional(),
+  login: z.literal(true).optional(),
+  params: z
+    .array(
+      z.object({
+        name: z.string().regex(NAME),
+        type: z.string().max(20),
+        required: z.boolean(),
+        description: text.optional(),
+        hint: text.optional(),
+        example: z.union([text, z.number(), z.boolean()]).optional(),
+      }),
+    )
+    .max(50),
 });
-const IndexEntrySchema = z.object({
-  site: z.string().regex(/^[a-z0-9][a-z0-9._-]{0,63}$/),
+const SearchMatchSchema = z.object({
+  name: z.string().regex(/^[a-z0-9][a-z0-9._-]{0,63}$/),
+  domain: z.string().regex(/^[a-z0-9.-]{1,253}$/),
   displayName: z.string().max(100).optional(),
   description: text.optional(),
-  /** the registrable domains the spec's ops send to or open: what a search by domain or URL matches */
-  domains: z.array(HOST).max(50),
-  sha256: z.string().regex(/^[0-9a-f]{64}$/),
-  operations: z.array(IndexOpSchema).max(LIMITS.operations),
+  operations: z.array(FoundOpSchema).max(LIMITS.operations),
 });
-const IndexSchema = z.object({ generated: z.string(), sites: z.array(IndexEntrySchema) });
-export type IndexEntry = z.infer<typeof IndexEntrySchema>;
-export type RegistryIndex = z.infer<typeof IndexSchema>;
-
-/** The index for 10k sites is a few MB; past this something is wrong. */
-const INDEX_CAP = 32 * 1024 * 1024;
-
-/** Where search reads the index: the Pages copy, or `index.json` beside the specs of a registry `API_ANYTHING_REGISTRY` names. */
-export const indexUrl = () => `${process.env.API_ANYTHING_REGISTRY ? registryBase() : PAGES}/index.json`;
-
-export function indexEntry(site: Site, text: string): IndexEntry {
-  return {
-    site: site.name,
-    ...(site.displayName ? { displayName: site.displayName } : {}),
-    ...(site.description ? { description: site.description } : {}),
-    domains: [
-      ...new Set([new URL(site.baseUrl).hostname, ...site.operations.flatMap(hostsOf)].map((h) => siteOf(h))),
-    ].sort(),
-    sha256: createHash("sha256").update(text).digest("hex"),
-    operations: site.operations.map((op) => ({
-      ...summarize(op),
-      ...(op.description ? { description: op.description } : {}),
-    })),
-  };
-}
-
-/** The index of a directory of specs (the registry's `sites/`), as CI builds it on every merge. */
-export function buildIndex(dir: string, generated = new Date().toISOString()): RegistryIndex {
-  const sites = readdirSync(dir)
-    .filter((f) => f.endsWith(".json") && f !== "index.json")
-    .sort()
-    .map((f) => {
-      const text = readFileSync(join(dir, f), "utf8");
-      return indexEntry({ ...parseSite(JSON.parse(text)), name: f.slice(0, -5) }, text);
-    });
-  return { generated, sites };
-}
-
-/** A long-lived caller's (an MCP server's) copy of the index: it searches often, and the index changes on a merge. */
-export type IndexCache = { url?: string; at?: number; index?: RegistryIndex };
-const INDEX_TTL = 10 * 60_000;
-
-/** The index, with each entry that breaks its rules dropped (one bad entry is no reason to lose the rest). */
-export async function fetchIndex(o: { fetchImpl?: typeof fetch; cache?: IndexCache } = {}): Promise<RegistryIndex> {
-  const from = indexUrl();
-  const c = o.cache;
-  if (c?.index && c.url === from && Date.now() - c.at! < INDEX_TTL) return c.index;
-  const body = await fetchCapped(from, INDEX_CAP, o.fetchImpl ?? fetch);
-  if (body === undefined) throw new Error(`the registry has no index at ${from}`);
-  let raw: { generated: unknown; sites: unknown[] };
-  try {
-    raw = z.object({ generated: z.string(), sites: z.array(z.unknown()) }).parse(JSON.parse(body));
-  } catch (e) {
-    throw new Error(`${from}: ${(e as Error).message.split("\n")[0]}`);
-  }
-  const sites = raw.sites.flatMap((e) => {
-    const r = IndexEntrySchema.safeParse(e);
-    return r.success ? [r.data] : [];
-  });
-  const index = { generated: raw.generated as string, sites };
-  if (c) Object.assign(c, { url: from, at: Date.now(), index });
-  return index;
-}
-
-// Words that say nothing about which site: a query is often a sentence ("the weather in paris").
-const STOP = new Set(
-  "and are best can cheap find for from get how into list near new now of on one or out per show some than that the their them then this top what when where which who why with you your".split(
-    " ",
-  ),
-);
-
-/** A text's search words: lower-cased, no stopword, none under 3 letters, a plural `s` dropped (not "news"). */
-const words = (text: string) =>
-  text
-    .toLowerCase()
-    .split(/[^a-z0-9]+/)
-    .filter((w) => w.length > 2 && !STOP.has(w))
-    .map((w) => (w.length > 4 && w.endsWith("s") && !/[su]s$/.test(w) ? w.slice(0, -1) : w));
-
-/** An op's signature, its camelCase names split: `searchBooks(q) -> avgRating` reads as search books ... rating. */
-const opWords = (text: string) => words(text.replace(/([a-z])([A-Z])/g, "$1 $2"));
-
-/** A query that names a domain or a URL, as its registrable domain. */
-function domainOf(query: string): string | undefined {
-  const q = query.trim();
-  if (!/^\S+\.\S+$/.test(q)) return undefined;
-  try {
-    const host = new URL(/^[a-z]+:\/\//i.test(q) ? q : `https://${q}`).hostname;
-    return parse(host, { allowPrivateDomains: true }).domain ? siteOf(host) : undefined;
-  } catch {
-    return undefined;
-  }
-}
 
 /**
- * How well an entry answers a query: a domain query matches the domains the spec uses; words weigh most in
- * the site's name, then its title and domains, then what its ops say they do and return.
+ * The name the registry already serves a site of `domain` under, if any: a seed keeps its own (goodreads.com
+ * is goodreads, ycombinator.com is hacker-news), and a new op uploaded under another name on that domain
+ * would go to review. Undefined when there is none or the registry cannot be reached.
  */
-export function score(e: IndexEntry, query: string): number {
-  const domain = domainOf(query);
-  if (domain) return e.domains.includes(domain) ? 100 : 0;
-  const name = words(e.site);
-  const title = words(`${e.displayName ?? ""} ${e.domains.join(" ")}`);
-  const about = [
-    ...words([e.description, ...e.operations.map((o) => o.description)].filter(Boolean).join(" ")),
-    ...opWords(e.operations.map((o) => o.op).join(" ")),
-  ];
-  let total = 0;
-  for (const w of new Set(words(query))) {
-    // part of a longer word: "book" in "bookshelf"; in the ops' text only from 5 letters, where "time" is in "datetime"
-    const hit = (list: string[], whole: number, part: number, min = 3) =>
-      list.includes(w) ? whole : w.length >= min && list.some((x) => x.includes(w)) ? part : 0;
-    // a word that misses entirely makes the site a worse answer than one that has every word
-    const s = Math.max(hit(name, 10, 6), hit(title, 6, 3), hit(about, 2, 1, 5));
-    total += s || -1;
+export async function sharedName(domain: string, o: { signal?: AbortSignal } = {}): Promise<string | undefined> {
+  try {
+    const r = await registryRequest<{ matches?: unknown }>(`/v1/search?q=${encodeURIComponent(domain)}&limit=10`, {
+      cap: 4 * 1024 * 1024,
+      timeoutMs: 5000,
+      signal: o.signal,
+    });
+    for (const m of Array.isArray(r.matches) ? r.matches : []) {
+      const p = SearchMatchSchema.safeParse(m);
+      if (p.success && p.data.domain === domain) return p.data.name;
+    }
+  } catch {
+    // no answer: the caller names it as the registry names a new site
   }
-  return total;
+  return undefined;
 }
 
-/** This machine's specs as index entries; one that does not load is left out, as `sites` reports it. */
-export function localEntries(): IndexEntry[] {
+/** One op of a search answer: enough to call it. A local op that is no registry version has no status. */
+export interface FoundOperation {
+  name: string;
+  signature: string;
+  description?: string;
+  status?: Status | string;
+  confirmations?: number;
+  successRate?: number;
+  login?: true;
+  write?: true;
+  params: z.infer<typeof FoundOpSchema>["params"];
+}
+
+export interface Found {
+  site: string;
+  /** the registrable domain its operations call: what the agent checks is the site the user means */
+  domain: string;
+  displayName?: string;
+  description?: string;
+  /** on this machine already: its own spec, a pulled one or a bundled one */
+  installed: boolean;
+  operations: FoundOperation[];
+}
+
+/** This machine's specs; one that does not load is left out, as `sites` reports it. */
+function localSites(): Site[] {
   return listSites().flatMap((name) => {
     try {
       const r = loadSite(name);
-      return r ? [indexEntry(r.site, readFileSync(r.path, "utf8"))] : [];
+      return r ? [r.site] : [];
     } catch {
       return [];
     }
   });
 }
 
-export interface Found {
-  site: string;
-  displayName?: string;
-  description?: string;
-  /** on this machine already: its own spec, a pulled one or a bundled one */
-  installed: boolean;
-  operations: IndexEntry["operations"];
-}
+const localFound = (s: Site): Found => ({
+  site: s.name,
+  domain: siteOf(new URL(s.baseUrl).hostname),
+  ...(s.displayName ? { displayName: s.displayName } : {}),
+  ...(s.description ? { description: s.description } : {}),
+  installed: true,
+  operations: s.operations.map((op) => ({
+    name: op.name,
+    signature: summarize(op).op,
+    ...(op.description ? { description: op.description } : {}),
+    ...(op.version ? { status: op.version.status } : {}),
+    ...(op.learnedLoggedIn ? { login: true as const } : {}),
+    ...(op.readOnly ? {} : { write: true as const }),
+    params: op.params.map((p) => ({
+      name: p.name,
+      type: p.type,
+      required: p.required,
+      ...(p.description ? { description: p.description } : {}),
+      ...(p.hint ? { hint: p.hint } : {}),
+      ...(["string", "number", "boolean"].includes(typeof p.example)
+        ? { example: p.example as string | number | boolean }
+        : {}),
+    })),
+  })),
+});
 
 /**
- * The sites that answer a query, best first: the registry's index merged with the specs on this machine (a
- * site learned here and never shared is found too). An index that cannot be fetched leaves the local ones,
- * with the reason in `registryError`.
+ * The sites that answer a query, best first: the registry's matches merged with the specs on this machine
+ * (a site learned here and never shared is found too; the local copy wins). A registry that cannot be
+ * reached leaves the local ones, with the reason in `registryError`. A registry match that breaks the
+ * limits is dropped, not the rest.
  */
 export async function search(
   query: string,
-  o: { fetchImpl?: typeof fetch; cache?: IndexCache; limit?: number; local?: IndexEntry[] } = {},
+  o: { limit?: number; local?: Site[] } = {},
 ): Promise<{ matches: Found[]; registryError?: string }> {
-  let remote: IndexEntry[] = [];
+  const limit = o.limit ?? 5;
+  let remote: z.infer<typeof SearchMatchSchema>[] = [];
   let registryError: string | undefined;
   try {
-    remote = (await fetchIndex(o)).sites;
+    const r = await registryRequest<{ matches?: unknown }>(`/v1/search?q=${encodeURIComponent(query)}&limit=${limit}`, {
+      cap: 4 * 1024 * 1024,
+    });
+    if (!Array.isArray(r.matches)) throw new Error(`${registryBase()}/v1/search answered no matches`);
+    remote = r.matches.flatMap((m) => {
+      const p = SearchMatchSchema.safeParse(m);
+      return p.success ? [p.data] : [];
+    });
   } catch (e) {
     registryError = (e as Error).message;
   }
-  const local = o.local ?? localEntries();
-  const installed = new Set(local.map((e) => e.site));
-  const entries = [...local, ...remote.filter((e) => !installed.has(e.site))];
-  const scored = entries
-    .map((e) => ({ e, s: score(e, query) }))
-    .sort((a, b) => b.s - a.s || a.e.site.localeCompare(b.e.site));
-  // a site far behind the best answer matched a stray word
-  const best = scored[0]?.s ?? 0;
+  const local = o.local ?? localSites();
+  const installed = new Set(local.map((s) => s.name));
+  const scored = [
+    ...local.map((s) => ({ found: localFound(s), s: score(indexEntry(s, ""), query), local: true })),
+    ...remote
+      .filter((m) => !installed.has(m.name))
+      .map((m) => ({
+        found: {
+          site: m.name,
+          domain: m.domain,
+          ...(m.displayName ? { displayName: m.displayName } : {}),
+          ...(m.description ? { description: m.description } : {}),
+          installed: false,
+          operations: m.operations,
+        },
+        s: score(
+          { ...m, site: m.name, domains: [m.domain], operations: m.operations.map((x) => ({ ...x, op: x.signature })) },
+          query,
+        ),
+        local: false,
+      })),
+  ];
+  const best = Math.max(0, ...scored.map((x) => x.s));
+  // a local site far behind the best answer matched a stray word; the registry already chose its own
   const matches = scored
-    .filter(({ s }) => s > 0 && s * 3 >= best)
-    .slice(0, o.limit ?? 5)
-    .map(({ e }) => ({
-      site: e.site,
-      ...(e.displayName ? { displayName: e.displayName } : {}),
-      ...(e.description ? { description: e.description } : {}),
-      installed: installed.has(e.site),
-      operations: e.operations,
-    }));
+    .filter((x) => !x.local || (x.s > 0 && x.s * 3 >= best))
+    .sort((a, b) => b.s - a.s || a.found.site.localeCompare(b.found.site))
+    .slice(0, limit)
+    .map((x) => x.found);
   return { matches, ...(registryError ? { registryError } : {}) };
 }

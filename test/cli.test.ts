@@ -1364,6 +1364,104 @@ describe("capture on a page with a reCAPTCHA frame from another site", {
   });
 });
 
+test("call fetches a shared site this machine lacks, marked as an agent's pull, before it calls", async () => {
+  const { startRegistry, served } = await import("./fixture/registry.js");
+  const { parseSite } = await import("../src/spec.js");
+  const reg = await startRegistry();
+  const home = mkdtempSync(join(tmpdir(), "api-anything-cli-pull-"));
+  try {
+    reg.sites.set(
+      "shelf",
+      served(
+        parseSite({
+          name: "shelf",
+          baseUrl: "https://www.shelf.example.net",
+          operations: [
+            {
+              name: "search",
+              request: { method: "GET", url: "https://www.shelf.example.net/api/search?q=dune", headers: {} },
+              slots: [{ param: "q", at: ["query:q"] }],
+              params: [{ name: "q", example: "dune" }],
+              trigger: { url: "https://www.shelf.example.net/search?q={q}" },
+              match: { host: "www.shelf.example.net", path: "/api/search" },
+              response: { extract: "hits" },
+              readOnly: true,
+            },
+          ],
+        }),
+      ),
+    );
+    const r = await new Promise<{ code: number; stdout: string }>((resolve) =>
+      execFile(
+        process.execPath,
+        ["--import", "tsx", CLI, "call", "shelf", "search", "q=kittens", "--dry"],
+        { cwd: ROOT, env: { ...process.env, API_ANYTHING_HOME: home, API_ANYTHING_REGISTRY: reg.url } },
+        (err, stdout) => resolve({ code: err ? Number(err.code ?? 1) : 0, stdout }),
+      ),
+    );
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.pulled, "shelf", r.stdout);
+    assert.equal(out.request.url, "https://www.shelf.example.net/api/search?q=kittens");
+    const saved = JSON.parse(readFileSync(join(home, "registry", "shelf.json"), "utf8"));
+    assert.equal(saved.shared.by, "agent");
+  } finally {
+    await reg.close();
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+describe("tier 2 for someone else's spec", { skip: !browserAvailable() && "no Chromium browser installed" }, () => {
+  // what execute.ts asks of pageFetch for an unreviewed candidate (`bare`) and for a hop off public addresses
+  const profileDir = mkdtempSync(join(tmpdir(), "api-anything-cli-tier2-"));
+  after(async () => {
+    const { closeBrowser } = await import("../src/browser.js");
+    await closeBrowser();
+    rmSync(profileDir, { recursive: true, force: true });
+  });
+
+  test("credentials omit sends none of the profile's cookies; the default sends them", async () => {
+    const { pageFetch } = await import("../src/browser.js");
+    // the fixture's HTML pages hand out the ct0 cookie
+    await pageFetch({ origin: fx.url, url: `${fx.url}/`, method: "GET", headers: {}, profileDir });
+    const sent = async (credentials?: "omit") => {
+      await pageFetch({
+        origin: fx.url,
+        url: `${fx.url}/api/tier2-probe`,
+        method: "GET",
+        headers: {},
+        profileDir,
+        ...(credentials ? { credentials } : {}),
+      });
+      return fx.calls.filter((c) => c.path === "/api/tier2-probe").at(-1)?.headers.cookie;
+    };
+    assert.match(String(await sent()), /ct0=/);
+    assert.equal(await sent("omit"), undefined);
+  });
+
+  test("an async redirect policy is awaited for each hop, and its refusal ends the fetch", async () => {
+    const { pageFetch } = await import("../src/browser.js");
+    const { RedirectRefused } = await import("../src/http.js");
+    const asked: string[] = [];
+    await assert.rejects(
+      pageFetch({
+        origin: fx.url,
+        url: `${fx.url}/community`,
+        method: "GET",
+        headers: {},
+        profileDir,
+        redirect: async (_from, status, location) => {
+          asked.push(`${status} ${location}`);
+          await new Promise((r) => setTimeout(r, 10));
+          throw new RedirectRefused("not following it: not public");
+        },
+      }),
+      /not public/,
+    );
+    assert.equal(asked.length, 1);
+    assert.match(asked[0]!, /^302 .*\/forum$/);
+  });
+});
+
 describe("call: answers that are not what their status says", () => {
   before(() => {
     mkdirSync(join(HOME, "sites"), { recursive: true });

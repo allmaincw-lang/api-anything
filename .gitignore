@@ -8,4 +8,5 @@ bench/video/raw*/
 bench/video/frames/
 bench/explore/state/
 _site/
+.wrangler/
 docs/media/explainer/frames/

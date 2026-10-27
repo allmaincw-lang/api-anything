@@ -23,6 +23,7 @@ import {
 import { buildRequest } from "./http.js";
 import { AmbiguousProfile } from "./import.js";
 import { type Candidate, capturePages, pageUrls, rankCandidates } from "./learn.js";
+import { learnSite } from "./learnsite.js";
 import {
   cookieNames,
   importSession,
@@ -34,9 +35,12 @@ import {
   windowRetry,
 } from "./login.js";
 import { type Outline, outline } from "./outline.js";
-import { plan, submit, writeOutbox } from "./publish.js";
+import { plan, uploadName } from "./publish.js";
 import { pull, search } from "./registry.js";
+import { settle } from "./report.js";
 import { loadSession } from "./session.js";
+import { AGENTS, type Agent, askYesNo, setup, summary } from "./setup.js";
+import { shareOps } from "./share.js";
 import {
   CheckSchema,
   HtmlRecipeSchema,
@@ -191,40 +195,66 @@ const HELP: Record<string, string> = {
   Writes a shareable spec: examples and response shapes stripped, and refused if a live cookie or
   session value is inside. --keep-examples keeps param examples you confirmed are public (so verify works).`,
   search: `api-anything search <words | domain | url>
-  Finds sites someone already turned into operations: the registry's index (shared specs) and the
-  specs on this machine, best match first. Words match a site's name, its description and what its
-  operations do and return ("book ratings"); a domain or a URL matches the sites whose operations
-  use it (news.ycombinator.com). Each match says whether it is installed; pull one that is not.
-  API_ANYTHING_REGISTRY overrides the registry (its index.json beside sites/).`,
+  Finds sites someone already turned into operations: the shared registry and the specs on this
+  machine, best match first, each op with its params and its status in the registry. Words match a
+  site's name, its description and what its operations do and return ("book ratings"); a domain or a
+  URL matches the sites whose operations use it (news.ycombinator.com). Each match says whether it is
+  installed; pull one that is not. API_ANYTHING_REGISTRY overrides the registry's URL.`,
   pull: `api-anything pull <site>
-  Fetches a spec someone shared from the registry (the api-anything repo's sites/ on GitHub) into
-  ~/.api-anything/registry, so you can call it without learning it. Someone else wrote it: it is
-  checked against the shared rules first, and its writes still need --allow-writes. Prints each op
-  (method, hosts, write, login) and the warnings a human should read; a pull again names what changed.
-  API_ANYTHING_REGISTRY overrides the registry's base URL.`,
-  publish: `api-anything publish <site> [--keep-examples] [--yes]
-  Shares a spec you learned: opens a pull request adding it to the registry, so others can pull it
-  instead of learning the site again. Without --yes it only previews: the exact files that would be
-  public (written to ~/.api-anything/outbox), what was stripped, the warnings, and what may be yours
-  (an email, an account id, a literal typed into the page). It refuses a spec holding a live cookie or
-  session value. --yes sends that preview, unchanged, with the GitHub CLI (gh, signed in): a fork, a
-  branch, commits under your account's noreply address, and a public pull request under your account.
-  --keep-examples keeps param examples you confirmed are public (so verify works for others).`,
-  mcp: `api-anything mcp [--allow-writes] [--sites a,b] [--print-config]
-  Serves list_sites, find_sites, list_operations, call_operation, get_job and login over stdio MCP,
-  and call_write_operation with --allow-writes. MCP cannot learn operations (use capture/add here).
-  list_operations pulls a shared site an agent asks for, with its reads only: its writes need a
-  human's api-anything pull. Its login only refreshes a session a human imported here. A call still
-  running after about 25 s answers class pending with a job, which get_job waits for.
+  Fetches a site someone shared from the registry into ~/.api-anything/registry, so you can call it
+  without learning it. Someone else wrote it: it is checked against the shared rules first, and its
+  writes still need --allow-writes. Prints each op (method, hosts, write, login, status) and the
+  warnings a human should read; a pull again names what changed. API_ANYTHING_REGISTRY overrides the
+  registry's URL.`,
+  publish: `api-anything publish <site> [op ...] [--yes]
+  Shares the ops of a site you learned (all of them, or the ones named) with the registry, so others
+  can call them instead of learning the site again. Without --yes it only previews: exactly what each
+  upload sends, what was stripped, the warnings, and what may be yours (an email, an account id, a
+  literal typed into the page). The param examples are sent: they must be values anyone may see. It
+  refuses an op holding a live cookie or session value, or failing its checks. --yes sends them, signed
+  with this install's key; an op that needed a login or writes is reviewed before others get it.`,
+  mcp: `api-anything mcp [--allow-writes] [--sites a,b] [--print-config] [--no-learn]
+  Serves list_sites, find_sites, list_operations, call_operation, get_job, login and learn_site over
+  stdio MCP, and call_write_operation with --allow-writes. list_operations and call_operation pull a
+  shared site an agent asks for, with its reads only: its writes need a human's api-anything pull. Its
+  login only refreshes a session a human imported here. A call still running after about 25 s answers
+  class pending with a job, which get_job waits for. With sharing on, an idle server checks a few new
+  shared operations a day, over plain HTTP with no cookies, and reports how calls went. learn_site
+  learns a read (as learn does); writes are learned here with add --write.
   --sites a,b     also serve each operation of these sites as a tool of its own (goodreads__searchBooks),
                   with its args' JSON Schema: no list_operations step first. Costs tokens per op
   --print-config  print the command or config entry that adds this server to Claude Code, Codex,
                   Gemini CLI, VS Code, Cursor and Claude Desktop, with absolute paths and the other
-                  flags given, instead of serving`,
+                  flags given, instead of serving
+  --no-learn      hide learn_site`,
+  setup: `api-anything setup [--yes | --no-share] [--agents claude-code,codex,cursor,claude-desktop] [--dry-run]
+  Connects the MCP server (npx -y api-anything mcp) to each agent found on this machine: Claude Code,
+  Codex, Cursor, Claude Desktop. Installs the skill for Claude Code (~/.claude/skills) and Codex
+  (~/.agents/skills). Checks for a Chromium browser, makes this install's key, and asks whether to help
+  build the shared catalog (default yes). Other entries in an agent's config are never changed; a file
+  is backed up to <file>.bak-api-anything before its first edit. Running it again changes nothing.
+  --yes        share: answer the question yes without asking
+  --no-share   do not share; answer the question no
+  --agents     connect these agents only, found or not
+  --dry-run    print what would change, and change nothing`,
+  learn: `api-anything learn <trigger> --args k=v --args2 k=v --args3 k=v [--site s] [--op o] [--intent text] [options]
+  Learns a read in one step and returns the answer to --args (as MCP learn_site does): runs the page with
+  --args and --args2, picks the request carrying them and the fields from the first run's outline, saves
+  the op with --args2 as its example, calls it with --args3 (kept as the op's check) and once with no
+  cookies, then shares it when sharing is on and it is public. A login op is shared only on your yes.
+  <trigger>   page URL with {param} placeholders, e.g. https://site.com/search?q={q}
+  --args      the values you want the answer for
+  --args2     another real value of the same kind (the op's shared example)
+  --args3     a third, different from both (the holdout check)
+  --from <id> --from2 <id>   learn again from an earlier learn's captures, with no browser
+  --pick-request <n>, --extract, --pick, --html, --embedded   choose the request and the recipe (see add)
+  Output: data, signature, chosen and alternatives (request and recipe), proof, shared.`,
 };
 
 const USAGE = `api-anything ${VERSION}: turn a website into operations an agent can call.
 
+  api-anything setup [--yes | --no-share] [--dry-run]
+  api-anything learn <url-template> --args k=v --args2 k=v --args3 k=v
   api-anything login <site|url> [--profile ... | --window | --cookies <file>]
   api-anything logout <site>
   api-anything capture <url> [--steps ...]
@@ -352,6 +382,16 @@ const OPTIONS = {
   max: { type: "string", multiple: true },
   expect: { type: "string" },
   purpose: { type: "string" },
+  args: { type: "string", multiple: true },
+  args2: { type: "string", multiple: true },
+  args3: { type: "string", multiple: true },
+  site: { type: "string" },
+  op: { type: "string" },
+  intent: { type: "string" },
+  agents: { type: "string" },
+  "dry-run": { type: "boolean" },
+  "no-share": { type: "boolean" },
+  "no-learn": { type: "boolean" },
   paging: { type: "string" },
   find: { type: "string" },
   sites: { type: "string" },
@@ -797,6 +837,14 @@ async function cmdCall({ v, pos }: Parsed): Promise<number> {
     base = json(v.json, z.record(z.string(), z.unknown()), "json") ?? {};
   }
   const args = { ...base, ...kv(rest) };
+  // A shared site this machine lacks is fetched first, as MCP does: an agent with a shell finds it by name.
+  // It is marked as an agent's pull, so MCP keeps its writes hidden until a human runs pull.
+  let pulled = false;
+  try {
+    if (!loadSite(site)) pulled = !!(await pull(site, { by: "agent" }));
+  } catch {
+    // not shared, or refused: call() answers "no site" with its next step
+  }
   if (v.dry) {
     const { site: s } = requireSite(site);
     const op = s.operations.find((o) => o.name === name);
@@ -807,7 +855,7 @@ async function cmdCall({ v, pos }: Parsed): Promise<number> {
       cookies: real.cookies.map((c) => ({ ...c, value: `<${c.name}>` })),
       values: Object.fromEntries(Object.keys(real.values).map((k) => [k, `<${k}>`])),
     };
-    out({ ok: true, dry: true, request: buildRequest(op, args, redacted) });
+    out({ ok: true, dry: true, request: buildRequest(op, args, redacted), ...(pulled ? { pulled: site } : {}) });
     return 0;
   }
   const maxTier = v["max-tier"] ? (Number(v["max-tier"]) as Tier) : undefined;
@@ -817,7 +865,7 @@ async function cmdCall({ v, pos }: Parsed): Promise<number> {
     idempotencyKey: v["idempotency-key"],
     maxTier,
   });
-  out(r);
+  out(pulled ? { ...r, pulled: site } : r);
   if (!r.ok) process.stderr.write(`next: ${r.next}\n`);
   return r.ok ? 0 : 1;
 }
@@ -1044,8 +1092,8 @@ async function cmdSearch({ pos }: Parsed): Promise<number> {
     next: !top
       ? "nobody shared one yet: learn it with api-anything capture and add, then share it with api-anything publish"
       : top.installed
-        ? `api-anything ops ${top.site} lists its operations`
-        : `api-anything pull ${top.site} fetches it; read its warnings with the user before the first call`,
+        ? `check that ${top.domain} is the site meant, then api-anything ops ${top.site} lists its operations`
+        : `check that ${top.domain} is the site meant (a lookalike name can point elsewhere), then api-anything pull ${top.site} fetches it; read its warnings with the user before the first call`,
   });
   return 0;
 }
@@ -1075,56 +1123,105 @@ async function cmdPull({ pos }: Parsed): Promise<number> {
 }
 
 async function cmdPublish({ v, pos }: Parsed): Promise<number> {
-  const { site } = requireSite(pos[0]);
-  const keepExamples = v["keep-examples"];
-  const again = `api-anything publish ${site.name}${keepExamples ? " --keep-examples" : ""}`;
+  const [name, ...ops] = pos;
+  const { site } = requireSite(name);
+  const again = `api-anything publish ${[site.name, ...ops].join(" ")}`;
+  let p: ReturnType<typeof plan>;
+  try {
+    // the preview shows what --yes sends: with the user's yes, their notes go too
+    p = plan(site.name, { ops, consent: true, as: await uploadName(site.name) });
+  } catch (e) {
+    throw new Fail(oneLine((e as Error).message), `api-anything ops ${site.name}`);
+  }
+  if (p.errors.length)
+    throw new Fail(
+      `refusing to publish ${p.site}: ${p.errors.length} problem(s)`,
+      "fix each one (a live value: re-add the op so learning makes it a ref; a failing check: see api-anything verify) and preview again",
+      { errors: p.errors },
+    );
   if (!v.yes) {
-    const p = plan(site.name, { keepExamples });
-    if (p.errors.length)
-      throw new Fail(
-        `refusing to publish ${p.site}: ${p.errors.length} problem(s)`,
-        "fix each one (a live value: re-add the op so learning makes it a ref) and preview again",
-        { errors: p.errors },
-      );
     out({
       ok: true,
       site: p.site,
-      files: writeOutbox(p),
+      ...(p.as ? { as: `${p.as}: the registry names a new site after its domain, so it goes up under that name` } : {}),
+      uploads: p.ops.map((o) => o.upload),
       operations: p.operations,
       stripped: p.stripped,
       warnings: p.warnings,
       personal: p.personal,
       checks: p.checks,
-      public: "the files and the pull request are public, under your GitHub account",
-      next: `show the user the files and every warning and personal item; only with their explicit OK: ${again} --yes`,
+      public: "each upload is public: anyone can fetch it from the registry, param examples included",
+      next: `show the user each upload and every warning and personal item; only with their explicit OK: ${again} --yes`,
     });
     return 0;
   }
-  let r: Awaited<ReturnType<typeof submit>>;
-  try {
-    r = await submit(site.name, { keepExamples });
-  } catch (e) {
-    const m = (e as Error).message;
-    throw new Fail(
-      m,
-      /no preview|changed since/.test(m)
-        ? `preview it first (${again}), show the user, then send that with --yes`
-        : /not installed|auth|HTTP 401/.test(m)
-          ? "install the GitHub CLI and sign in: gh auth login"
-          : /already public in your fork/.test(m)
-            ? "tell the user the files may be public in their fork; fix the cause and run it again to open the pull request"
-            : "no file of the spec was sent; fix the cause and run it again",
-    );
-  }
+  const shared = await shareOps(
+    site.name,
+    p.ops.map((o) => o.op),
+    { evidence: {}, consent: true },
+  );
+  const ok = shared.every((s) => s.shared);
   out({
-    ok: true,
-    ...r,
-    next: "a maintainer reviews the pull request and CI checks it with the shared rules; once it merges, anyone can api-anything pull it",
+    ok,
+    shared,
+    next: ok
+      ? "others can call them now; one that needed a login or writes is served to others once a maintainer reviews it"
+      : "fix the reason given for each op that was not shared, then run it again",
   });
-  return 0;
+  return ok ? 0 : 1;
+}
+
+async function cmdSetup({ v }: Parsed): Promise<number> {
+  if (v.yes && v["no-share"]) throw new Fail("--yes and --no-share contradict each other", "pass one of them");
+  const agents = v.agents?.split(",").map((a) => a.trim());
+  const unknown = agents?.filter((a) => !(AGENTS as readonly string[]).includes(a));
+  if (unknown?.length)
+    throw new Fail(
+      `unknown agent ${unknown.join(", ")}; the agents are ${AGENTS.join(", ")}`,
+      "api-anything setup --help",
+    );
+  const r = await setup({
+    agents: agents as Agent[] | undefined,
+    dryRun: v["dry-run"],
+    share: v.yes ? true : v["no-share"] ? false : undefined,
+    ask: process.stdin.isTTY && process.stderr.isTTY ? askYesNo : undefined,
+  });
+  out(r);
+  process.stderr.write(`${summary(r)}\n`);
+  return r.ok ? 0 : 1;
+}
+
+async function cmdLearn({ v, pos }: Parsed): Promise<number> {
+  const trigger = pos[0];
+  if (!trigger) throw new Fail("missing <trigger>", "api-anything learn --help");
+  if ((v.from === undefined) !== (v.from2 === undefined))
+    throw new Fail("--from and --from2 go together: the two captures of an earlier learn", "api-anything learn --help");
+  const r = await learnSite(
+    {
+      trigger,
+      args: kv(v.args),
+      args2: kv(v.args2),
+      args3: kv(v.args3),
+      ...(v.site ? { site: v.site } : {}),
+      ...(v.op ? { op: v.op } : {}),
+      ...(v.intent ? { intent: v.intent } : {}),
+      ...(v["pick-request"] !== undefined ? { pickRequest: Number(v["pick-request"]) } : {}),
+      ...(v.extract ? { extract: v.extract } : {}),
+      ...(v.pick ? { pick: splitPick(v.pick) } : {}),
+      ...(v.html ? { html: json(v.html, HtmlRecipeSchema, "html") } : {}),
+      ...(v.embedded ? { embedded: v.embedded } : {}),
+      ...(v.from && v.from2 ? { captures: [v.from, v.from2] as [string, string] } : {}),
+      ...(v.write ? { write: true } : {}),
+    },
+    { consent: process.stdin.isTTY && process.stderr.isTTY ? askYesNo : undefined },
+  );
+  out(r);
+  if (r.next) process.stderr.write(`next: ${r.next}\n`);
+  return r.ok ? 0 : 1;
 }
 
 async function cmdMcp({ v }: Parsed): Promise<number> {
+  if (v["no-learn"]) (await import("./mcp-learn.js")).learnTool.enabled = false;
   const sites = (v.sites ?? "")
     .split(",")
     .map((s) => s.trim())
@@ -1134,6 +1231,7 @@ async function cmdMcp({ v }: Parsed): Promise<number> {
     const flags = [
       ...(v["allow-writes"] ? ["--allow-writes"] : []),
       ...(sites.length ? ["--sites", sites.join(",")] : []),
+      ...(v["no-learn"] ? ["--no-learn"] : []),
     ];
     process.stdout.write(`${printConfig(launchOf(fileURLToPath(import.meta.url), flags))}\n`);
     return 0;
@@ -1185,8 +1283,28 @@ const COMMANDS: Record<string, { run: (p: Parsed) => number | Promise<number>; f
   export: { run: cmdExport, flags: ["out", "keep-examples", "force"] },
   search: { run: cmdSearch, flags: [] },
   pull: { run: cmdPull, flags: [] },
-  publish: { run: cmdPublish, flags: ["keep-examples", "yes"] },
-  mcp: { run: cmdMcp, flags: ["allow-writes", "sites", "print-config"] },
+  publish: { run: cmdPublish, flags: ["yes"] },
+  mcp: { run: cmdMcp, flags: ["allow-writes", "sites", "print-config", "no-learn"] },
+  setup: { run: cmdSetup, flags: ["yes", "no-share", "agents", "dry-run"] },
+  learn: {
+    run: cmdLearn,
+    flags: [
+      "args",
+      "args2",
+      "args3",
+      "site",
+      "op",
+      "intent",
+      "pick-request",
+      "extract",
+      "pick",
+      "html",
+      "embedded",
+      "from",
+      "from2",
+      "write",
+    ],
+  },
 };
 
 async function run(argv: string[]): Promise<number> {
@@ -1218,6 +1336,8 @@ async function run(argv: string[]): Promise<number> {
 try {
   const code = await run(process.argv.slice(2));
   if (code >= 0) {
+    // the answer is out: reports and heal-backs get a moment, never a wait the user notices
+    await settle(1500);
     await closeBrowser();
     process.exitCode = code;
   }
