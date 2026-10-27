@@ -797,13 +797,17 @@ const renamed = (async (input: string | URL | Request) => {
   return q ? json({ hits: [{ q }] }) : json({ message: "missing query" });
 }) as typeof fetch;
 
+/** The repair as the registry serves it, under the name it holds the site by: example-com for a site learned here as demo. */
 const repaired = (status: "live" | "candidate" = "live", op: Record<string, unknown> = {}) =>
   served(
-    site({
-      request: { method: "GET", url: "https://www.example.com/api/search?query=kittens", headers: {} },
-      slots: [{ param: "q", at: ["query:query"] }],
-      ...op,
-    }),
+    site(
+      {
+        request: { method: "GET", url: "https://www.example.com/api/search?query=kittens", headers: {} },
+        slots: [{ param: "q", at: ["query:query"] }],
+        ...op,
+      },
+      { name: "example-com" },
+    ),
     undefined,
     status,
   );
@@ -813,7 +817,8 @@ test("a drifted registry version takes the version the registry serves now, befo
   const parent = "d".repeat(64);
   saveSite(site({ version: { hash: parent, status: "live" } }));
   const fix = repaired();
-  fake.sites.set("demo", fix);
+  // learned here as demo, shared as example-com: the repair is asked for by the registry's name
+  fake.sites.set("example-com", fix);
   const r = await call("demo", "search", { q: "bob" }, { maxTier: 1, minIntervalMs: 0, fetchImpl: renamed });
   assert.equal(r.ok, true, JSON.stringify(r));
   assert.equal(r.healed, true);
@@ -835,15 +840,17 @@ test("a drifted registry version takes the version the registry serves now, befo
   assert.equal(uploads().length, 0, "the registry's own version is not shared back as a heal");
 });
 
-test("the registry's version is not taken when it is no live one, or sends to another endpoint", async () => {
+test("the registry's version is not taken when it is no live one, sends to another endpoint, or needs a tier the caller does not allow", async () => {
   shareOn();
   const parent = "e".repeat(64);
   for (const fix of [
     repaired("candidate"),
     repaired("live", { match: { host: "www.example.com", path: "/api/find" } }),
+    // it needs the browser's page fetch, and the caller allows plain HTTP only
+    repaired("live", { minTier: 2 }),
   ]) {
     saveSite(site({ version: { hash: parent, status: "live" } }));
-    fake.sites.set("demo", fix);
+    fake.sites.set("example-com", fix);
     const r = await call("demo", "search", { q: "bob" }, { maxTier: 1, minIntervalMs: 0, fetchImpl: renamed });
     assert.equal(r.ok, false);
     assert.equal(loadSite("demo")!.site.operations[0]!.version?.hash, parent, "the op is as it was");
@@ -877,7 +884,8 @@ test("an op learned signed in sends only its fingerprint, then its anonymous bod
   assert.deepEqual(Object.keys(body).sort(), ["fingerprint", "nameHash", "site"]);
   assert.doesNotMatch(JSON.stringify(body), /secret|reading list|books I own/);
 
-  fake.wanted = [{ site: body.site.name, fingerprint: body.fingerprint }];
+  // three installs hold the op, under names that differ: the learner's own name never leaves
+  fake.wanted = [{ site: body.site.name, fingerprint: body.fingerprint, named: false }];
   const answered = await answerClaims();
   assert.deepEqual(
     answered.map((a) => [a.op, a.status]),
@@ -885,6 +893,7 @@ test("an op learned signed in sends only its fingerprint, then its anonymous bod
   );
   const [u] = fake.uploads() as (ReturnType<typeof fake.uploads>[number] & { claim?: string })[];
   assert.equal(u!.claim, body.fingerprint);
+  assert.equal(u!.operation.name, `op_${body.fingerprint.slice(0, 8)}`, "a name k installs did not choose stays home");
   assert.equal(u!.operation.description, undefined);
   assert.equal(u!.operation.params[0]!.example, undefined, "the user's own args stay home");
   assert.equal(u!.operation.params[0]!.description, undefined);
@@ -900,7 +909,7 @@ test("an op learned signed in sends only its fingerprint, then its anonymous bod
 test("a registry that asks for a fingerprint this install never claimed gets nothing; with sharing off nothing is claimed", async () => {
   shareOn();
   saveSite(signedInSite());
-  fake.wanted = [{ site: "example-com", fingerprint: "f".repeat(64) }];
+  fake.wanted = [{ site: "example-com", fingerprint: "f".repeat(64), named: true }];
   await shareOps("demo", ["search"], { evidence: {} });
   assert.equal(uploads().length, 0);
   assert.deepEqual(await answerClaims(), []);
@@ -910,4 +919,29 @@ test("a registry that asks for a fingerprint this install never claimed gets not
   shareOn(false);
   await shareOps("demo", ["search"], { evidence: {} });
   assert.equal(fake.received.filter((r) => r.path === "/v1/claims").length, 0);
+});
+
+test("a claim is answered under the name the site went up under, and with its own name once k installs chose it", async () => {
+  shareOn();
+  saveSite(signedInSite());
+  // the registry already serves example.com as demo, so the site goes up as demo, not example-com
+  fake.matches = [{ name: "demo", domain: "example.com", operations: [] }];
+  try {
+    await shareOps("demo", ["search"], { evidence: {} });
+    const [claim] = fake.received.filter((r) => r.path === "/v1/claims");
+    const body = claim!.body as { site: { name: string }; fingerprint: string };
+    assert.equal(body.site.name, "demo");
+    fake.wanted = [{ site: "demo", fingerprint: body.fingerprint, named: true }];
+    const answered = await answerClaims();
+    assert.deepEqual(
+      answered.map((a) => a.op),
+      ["search"],
+      "the upload is rebuilt under demo, so it still hashes to the fingerprint",
+    );
+    const [u] = fake.uploads();
+    assert.equal(u!.site.name, "demo");
+    assert.equal(u!.operation.name, "search");
+  } finally {
+    fake.matches = [];
+  }
 });

@@ -113,7 +113,9 @@ each of them, on their next claim or `GET /v1/claims`, with the fingerprints it 
 asks at most every 6 hours. A holder then uploads the anonymous op with `claim` set; the site goes up by
 its name, domain and address alone. The registry accepts it only from an install that claimed that
 fingerprint, only in anonymous form, only if it hashes to the fingerprint, and keeps the op's name only
-if as many installs gave it that name (otherwise `op_<fingerprint>`). The client sends a body only for a
+if as many installs gave it that name. Each wanted fingerprint says so (`named`), and when it is false
+the client sends the op as `op_<fingerprint>`: a name only its learner chose never leaves the machine,
+not even for the registry to replace. A claim is answered under the name the site went up under. The client sends a body only for a
 fingerprint it claimed itself and its op still hashes to: that k installs agree is the registry's claim,
 and a registry that asks for anything else gets nothing.
 
@@ -198,10 +200,11 @@ maintainer sets its status (`POST /v1/admin/versions/:hash`), when it:
 - Identical repairs from many installs hash the same: each upload of an existing version counts as
   its uploader's confirmation.
 - A repair reaches everyone once it is live. A drifted call of a registry version first asks the
-  registry (`GET /v1/sites/:name`, at most 3 s) for the version it serves for that op now. A different
-  version that is live, keeps the op's match and passes the shared rules replaces the op where this
-  machine reads it (the rest of the spec untouched) and is tried before any heal of the client's own:
-  one request in place of a browser run. The old version is reported `fail`, the new one `ok`, and
+  registry (`GET /v1/sites/:name`, by the name the registry holds the site under, at most 3 s) for the
+  version it serves for that op now. A different version that is live, keeps the op's match and passes
+  the shared rules is tried before any heal of the client's own, at the tier it asks for if the caller
+  allows it: one request in place of a browser run. Only if it answers does it replace the op where
+  this machine reads it (the rest of the spec untouched). The old version is reported `fail`, the new one `ok`, and
   nothing is uploaded, since the version is the registry's already.
 - Versions of one op are grouped by its site and op name; each version also stores its match (method,
   host, path, GraphQL operationName). The match alone would merge distinct ops that share an endpoint
