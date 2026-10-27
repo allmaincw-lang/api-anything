@@ -5,6 +5,7 @@
  */
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -16,9 +17,10 @@ import { call } from "../src/execute.js";
 import { resolver } from "../src/http.js";
 import { ensureKey, saveSettings, signedHeaders } from "../src/identity.js";
 import { registryName } from "../src/publish.js";
+import { anonymous, fingerprintText } from "../src/registry-api.js";
 import { settle } from "../src/report.js";
 import { mergeCapture, saveSession } from "../src/session.js";
-import { HOLDOUT_PURPOSE, shareOps } from "../src/share.js";
+import { answerClaims, HOLDOUT_PURPOSE, shareOps } from "../src/share.js";
 import { parseSite, type Site } from "../src/spec.js";
 import { loadSite, registryDir, saveSite, userSitesDir } from "../src/store.js";
 import { type FakeRegistry, hashOf, served, startRegistry } from "./fixture/registry.js";
@@ -44,6 +46,7 @@ beforeEach(() => {
   fake.sites.clear();
   fake.raw.clear();
   fake.jobs = [];
+  fake.wanted = [];
   fake.received.length = 0;
   fake.down = false;
   fake.hang = false;
@@ -195,7 +198,10 @@ test("shareOps: anything that is not a public read waits for the user's yes", as
     const [out] = await shareOps("demo", ["search"], { evidence });
     assert.equal(out!.shared, false, what);
     assert.equal(out!.needsConsent, true, what);
-    assert.match(out!.reason ?? "", /only with the user's yes/, what);
+    // an op learned signed in also goes up by its fingerprint alone, never its body
+    const expected =
+      what === "learned signed in" ? /only its fingerprint .* or now with the user's yes/ : /only with the user's yes/;
+    assert.match(out!.reason ?? "", expected, what);
   }
   assert.equal(uploads().length, 0, "nothing was sent");
 
@@ -850,4 +856,92 @@ test("the registry's version is not taken when it is no live one, sends to anoth
     assert.equal(loadSite("demo")!.site.operations[0]!.version?.hash, parent, "the op is as it was");
   }
   await settle(2000);
+});
+
+/* ------------------------------------------------ ops learned signed in */
+
+const signedInSite = () =>
+  site(
+    {
+      description: "my reading list",
+      learnedLoggedIn: true,
+      params: [{ name: "q", example: "my secret search", description: "what I look for" }],
+    },
+    { description: "the books I own" },
+  );
+
+test("an op learned signed in sends only its fingerprint, then its anonymous body when the registry asks", async () => {
+  shareOn();
+  saveSite(signedInSite());
+  const [out] = await shareOps("demo", ["search"], { evidence: {} });
+  assert.equal(out!.shared, false);
+  assert.equal(out!.needsConsent, true, "the user can still say yes now");
+  assert.match(out!.reason!, /only its fingerprint went to the registry/);
+  assert.equal(uploads().length, 0, "no body went up");
+  const [claim] = fake.received.filter((r) => r.path === "/v1/claims");
+  assert.ok(claim?.verified, "the claim is signed");
+  const body = claim!.body as { site: { name: string }; fingerprint: string; nameHash: string };
+  assert.deepEqual(Object.keys(body).sort(), ["fingerprint", "nameHash", "site"]);
+  assert.doesNotMatch(JSON.stringify(body), /secret|reading list|books I own/);
+
+  // three installs hold the op, under names that differ: the learner's own name never leaves
+  fake.wanted = [{ site: body.site.name, fingerprint: body.fingerprint, named: false }];
+  const answered = await answerClaims();
+  assert.deepEqual(
+    answered.map((a) => [a.op, a.status]),
+    [["search", "review"]],
+  );
+  const [u] = fake.uploads() as (ReturnType<typeof fake.uploads>[number] & { claim?: string })[];
+  assert.equal(u!.claim, body.fingerprint);
+  assert.equal(u!.operation.name, `op_${body.fingerprint.slice(0, 8)}`, "a name k installs did not choose stays home");
+  assert.equal(u!.operation.description, undefined);
+  assert.equal(u!.operation.params[0]!.example, undefined, "the user's own args stay home");
+  assert.equal(u!.operation.params[0]!.description, undefined);
+  assert.equal(u!.site.description, undefined);
+  assert.equal(
+    createHash("sha256")
+      .update(fingerprintText(u!.site.name, anonymous(u!.operation)))
+      .digest("hex"),
+    body.fingerprint,
+  );
+});
+
+test("a registry that asks for a fingerprint this install never claimed gets nothing; with sharing off nothing is claimed", async () => {
+  shareOn();
+  saveSite(signedInSite());
+  fake.wanted = [{ site: "example-com", fingerprint: "f".repeat(64), named: true }];
+  await shareOps("demo", ["search"], { evidence: {} });
+  assert.equal(uploads().length, 0);
+  assert.deepEqual(await answerClaims(), []);
+  assert.equal(uploads().length, 0);
+
+  fake.received.length = 0;
+  shareOn(false);
+  await shareOps("demo", ["search"], { evidence: {} });
+  assert.equal(fake.received.filter((r) => r.path === "/v1/claims").length, 0);
+});
+
+test("a claim is answered under the name the site went up under, and with its own name once k installs chose it", async () => {
+  shareOn();
+  saveSite(signedInSite());
+  // the registry already serves example.com as demo, so the site goes up as demo, not example-com
+  fake.matches = [{ name: "demo", domain: "example.com", operations: [] }];
+  try {
+    await shareOps("demo", ["search"], { evidence: {} });
+    const [claim] = fake.received.filter((r) => r.path === "/v1/claims");
+    const body = claim!.body as { site: { name: string }; fingerprint: string };
+    assert.equal(body.site.name, "demo");
+    fake.wanted = [{ site: "demo", fingerprint: body.fingerprint, named: true }];
+    const answered = await answerClaims();
+    assert.deepEqual(
+      answered.map((a) => a.op),
+      ["search"],
+      "the upload is rebuilt under demo, so it still hashes to the fingerprint",
+    );
+    const [u] = fake.uploads();
+    assert.equal(u!.site.name, "demo");
+    assert.equal(u!.operation.name, "search");
+  } finally {
+    fake.matches = [];
+  }
 });

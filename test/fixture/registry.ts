@@ -70,6 +70,8 @@ export async function startRegistry() {
     /** what GET /v1/search answers, whatever the query */
     matches: [] as SearchMatch[],
     jobs: [] as VerifyJob[],
+    /** what POST and GET /v1/claims answer as wanted */
+    wanted: [] as { site: string; fingerprint: string; named: boolean }[],
     /** raw answers by path, ahead of everything else: for answers the contract does not allow */
     raw: new Map<string, { status: number; body: string; headers?: Record<string, string> }>(),
     /** every request answers 503 */
@@ -131,6 +133,7 @@ export async function startRegistry() {
       if (method === "POST" && u.pathname === "/v1/reports")
         return send(200, { accepted: body.reports.length, ignored: 0 });
       if (method === "GET" && u.pathname === "/v1/verify-jobs") return send(200, { jobs: fake.jobs });
+      if (u.pathname === "/v1/claims") return send(200, { wanted: fake.wanted });
       send(404, { error: "no such endpoint" });
     });
   });

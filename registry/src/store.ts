@@ -123,12 +123,14 @@ export interface NewVersion {
   /** the uploader's network hash; a seed has none */
   uploaderNetwork?: string;
   evidence: Evidence;
+  /** the claim (fingerprint) this version answers */
+  claim?: string;
 }
 
 export const addVersion = (db: D1Database, v: NewVersion, now: string) =>
   db
     .prepare(
-      "INSERT INTO versions (hash, site, op_name, sig, operation, parent, heal, status, reasons, uploader, evidence, created_at, updated_at, last_ok_at, live_since, uploader_network) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      "INSERT INTO versions (hash, site, op_name, sig, operation, parent, heal, status, reasons, uploader, evidence, created_at, updated_at, last_ok_at, live_since, uploader_network, claim) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(
       v.hash,
@@ -147,6 +149,7 @@ export const addVersion = (db: D1Database, v: NewVersion, now: string) =>
       null,
       v.status === "live" ? now : null,
       v.uploaderNetwork ?? null,
+      v.claim ?? null,
     )
     .run();
 
@@ -403,3 +406,63 @@ export const archive = (db: D1Database, hashes: string[], now: string, hour: num
     db.prepare("DELETE FROM versions WHERE status = 'archived' AND updated_at < ?").bind(purgeBefore),
     db.prepare("DELETE FROM rates WHERE hour < ?").bind(hour - 24),
   ]);
+
+/* ------------------------------------------------------------------ claims */
+
+export interface ClaimRow {
+  fingerprint: string;
+  site: string;
+  key: string;
+  network: string;
+  name_hash: string;
+}
+
+export const putClaim = (db: D1Database, c: ClaimRow, now: string) =>
+  db
+    .prepare(
+      `INSERT INTO claims (fingerprint, site, key, network, name_hash, at) VALUES (?, ?, ?, ?, ?, ?)
+       ON CONFLICT (fingerprint, key) DO UPDATE SET network = excluded.network, name_hash = excluded.name_hash, at = excluded.at`,
+    )
+    .bind(c.fingerprint, c.site, c.key, c.network, c.name_hash, now)
+    .run();
+
+export async function claimsOf(db: D1Database, fingerprint: string): Promise<ClaimRow[]> {
+  const { results } = await db
+    .prepare("SELECT fingerprint, site, key, network, name_hash FROM claims WHERE fingerprint = ?")
+    .bind(fingerprint)
+    .all<ClaimRow>();
+  return results;
+}
+
+/** How many installs hold `rows`, counting each network once: a thousand keys on one machine are one voice. */
+export const holders = (rows: { key: string; network: string }[]) =>
+  Math.min(new Set(rows.map((r) => r.key)).size, new Set(rows.map((r) => r.network)).size);
+
+/**
+ * This key's claims that `k` installs hold and whose body the registry does not have yet, each with
+ * whether `k` of them gave the op this key's name too.
+ */
+export async function wantedClaims(
+  db: D1Database,
+  key: string,
+  k: number,
+): Promise<{ site: string; fingerprint: string; named: boolean }[]> {
+  const { results } = await db
+    .prepare(
+      `SELECT c.fingerprint, c.site, c.name_hash FROM claims c
+       WHERE c.key = ? AND NOT EXISTS (SELECT 1 FROM versions v WHERE v.claim = c.fingerprint)`,
+    )
+    .bind(key)
+    .all<{ fingerprint: string; site: string; name_hash: string }>();
+  const out = [];
+  for (const r of results) {
+    const all = await claimsOf(db, r.fingerprint);
+    if (holders(all) >= k)
+      out.push({
+        site: r.site,
+        fingerprint: r.fingerprint,
+        named: holders(all.filter((x) => x.name_hash === r.name_hash)) >= k,
+      });
+  }
+  return out;
+}

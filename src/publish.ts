@@ -53,7 +53,7 @@ export function personalIn(value: unknown, path = "$"): string[] {
  * What in an upload may be the publisher's own, for them to look at: no scan tells an account id from
  * a constant. Every string and key of the op and the site's fields is read, and the notes.
  */
-function personal(u: VersionUpload): string[] {
+export function personal(u: VersionUpload): string[] {
   const { notes, ...site } = u.site;
   const found = [...personalIn(site, "$.site"), ...personalIn(u.operation, "$.operation")];
   const op = u.operation;
@@ -82,7 +82,7 @@ function personal(u: VersionUpload): string[] {
 }
 
 /** Every host an op sends to or opens, `goto` steps included. */
-const hostsOfOp = (op: Operation) => [
+export const hostsOfOp = (op: Operation) => [
   ...hostsOf(op),
   ...(op.trigger.steps ?? []).flatMap((s) => {
     try {

@@ -70,7 +70,8 @@ web server does, and does not store it.
    carries no query document (a persisted query, named by a hash or an id), or a param that is the whole
    body or the document. Over MCP the trigger must be an https page on a public host.
 4. `shareOps` uploads it (`POST /v1/versions`, signed). A public read goes automatically when
-   `share` is on. A login op or a write is uploaded only with the user's yes (CLI prompt, or MCP
+   `share` is on. A login op is claimed by its fingerprint ("Ops learned signed in"). A login op or a
+   write is uploaded with its body only with the user's yes (CLI prompt, or MCP
    elicitation where the client supports it); the prompt lists what in the upload may be the user's own
    (an email, an id, a literal typed into the page). The published examples are the agent's chosen second
    example and holdout, never the user's own request. An automatic upload carries no checks but
@@ -86,6 +87,33 @@ web server does, and does not store it.
    under its own name when it is pulled or bundled or the registry serves its domain under that name,
    and otherwise under the slug, which the outcome's `as` names (`publish.ts` `registryName`,
    `uploadName`).
+
+## Ops learned signed in
+
+A login op's body can encode the person who learned it: an account id in a path, an intranet host, a
+literal they typed. Asking every user before each such upload means almost none go up. So when sharing
+is on, an op learned signed in that no rule refuses, that stays on its own site, and that shows nothing
+personal in its `anonymous` form (no description, param descriptions, hints, examples or checks) is
+**claimed** instead (`POST /v1/claims`, signed): the site's name and domain, the op's fingerprint
+(sha256 of `fingerprintText`: the site, then the anonymous op without its name) and a hash of its name.
+Nothing else leaves the machine.
+
+Once installs on `CLAIM_KEYS` (3) distinct networks claimed the same fingerprint, the registry answers
+each of them, on their next claim or `GET /v1/claims`, with the fingerprints it wants. An idle MCP server
+asks at most every 6 hours. A holder then uploads the anonymous op with `claim` set; the site goes up by
+its name, domain and address alone. The registry accepts it only from an install that claimed that
+fingerprint, only in anonymous form, only if it hashes to the fingerprint, and keeps the op's name only
+if as many installs gave it that name. Each wanted fingerprint says so (`named`), and when it is false
+the client sends the op as `op_<fingerprint>`: a name only its learner chose never leaves the machine,
+not even for the registry to replace. A claim is answered under the name the site went up under. The client sends a body only for a
+fingerprint it claimed itself and its op still hashes to: that k installs agree is the registry's claim,
+and a registry that asks for anything else gets nothing.
+
+Identical bytes from strangers on different networks cannot hold one person's own value, since a
+personal literal differs per person and its fingerprint never converges. This settles privacy, not
+safety. The version still goes to `review` ("learned while signed in"), with the number of installs that
+hold it among its reasons, because a login op runs with every caller's credentials. The user can still
+say yes and share it at once, as before.
 
 ## Verification by the crowd
 
@@ -224,7 +252,8 @@ D1 tables: `sites` (name, domain, display fields, notes, first uploader), `versi
 op name, match signature, operation JSON, parent, status, uploader and its network hash, evidence,
 timestamps including when it first went live), `reports`
 (hash, key, network hash, outcome, tier, at), `keys` (public key, first seen, counts), `rates` (hourly
-counters, kept for a day). No args, no response data, no IP addresses.
+counters, kept for a day), `claims` (fingerprint, site, key, network hash, name hash, at). No args, no
+response data, no IP addresses.
 
 About the caller, the registry keeps its reports, keyed by install key and time, and nothing else:
 no account, no IP address (a network is a salted hash, used to count distinct networks and for rate

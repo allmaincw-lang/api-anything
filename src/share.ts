@@ -2,12 +2,26 @@
  * Sharing what this install learned or healed with the registry (docs/REGISTRY.md): publish.ts builds
  * and checks each upload, this sends the ones the rules allow, signed, and records the version.
  */
+import { createHash } from "node:crypto";
+import { join } from "node:path";
 import { cleanCall } from "./clean.js";
+import { siteOf } from "./domain.js";
 import { loadSettings } from "./identity.js";
-import { plan, uploadName } from "./publish.js";
+import { hostsOfOp, type OpPlan, personal, plan, uploadName } from "./publish.js";
 import { registryRequest } from "./registry.js";
-import type { Evidence, Status, UploadResult } from "./registry-api.js";
+import {
+  anonymous,
+  type Claim,
+  type ClaimResult,
+  type Evidence,
+  fingerprintText,
+  nameHashText,
+  type Status,
+  type UploadResult,
+  type VersionUpload,
+} from "./registry-api.js";
 import { flushReports } from "./report.js";
+import { home, readJson, withLock, writePrivate } from "./session.js";
 import type { Operation } from "./spec.js";
 import { loadSite, updateSite } from "./store.js";
 
@@ -74,6 +88,18 @@ export async function shareOps(
       return j === undefined || checks[Number(j)]?.purpose !== HOLDOUT_PURPOSE;
     });
     if (!o.consent && !(op.public && share && !holding.length)) {
+      // An op learned signed in may still go, without asking anyone: by its fingerprint now, and its
+      // anonymous body only once installs on enough networks hold the same op (claim).
+      const claimed = share ? await claim(p.site, op, o.signal) : undefined;
+      if (claimed) {
+        out.push({
+          ...base,
+          shared: false,
+          needsConsent: true,
+          reason: `learned signed in: only its fingerprint went to the registry (${claimed}); its body follows by itself once other installs hold the same op, or now with the user's yes`,
+        });
+        continue;
+      }
       out.push({
         ...base,
         shared: false,
@@ -156,4 +182,106 @@ export async function healBack(
     signal: o.signal,
   });
   return shared;
+}
+
+/* --------------------------------------------------- ops learned signed in */
+
+const claimsFile = () => join(home(), "claims.json");
+/** each claimed fingerprint: the local site and op, and the name the site went up under (`as`) */
+type Claimed = Record<string, { site: string; op: string; as?: string }>;
+
+const sha = (text: string) => createHash("sha256").update(text).digest("hex");
+
+/** The upload of an op answering a claim: its anonymous form, and the site by its name and address alone. */
+function claimUpload(op: OpPlan): VersionUpload {
+  const { name, domain, baseUrl, loginCookies } = op.upload.site;
+  return {
+    site: { name, domain, baseUrl, ...(loginCookies ? { loginCookies } : {}) },
+    operation: anonymous(op.upload.operation),
+    evidence: { ...op.upload.evidence, learnedLoggedIn: true, cleanReplay: "skipped" },
+  };
+}
+
+/**
+ * Claims an op learned signed in by its fingerprint, when it could ever go up that way: a read on its own
+ * site, refused by no rule, with nothing of the user's own in its anonymous form (that would make it
+ * this person's alone, so it would never match another install's anyway). Answers the fingerprint's
+ * start, or undefined when it is not claimed. Any claim the registry already wants is answered now.
+ */
+async function claim(site: string, op: OpPlan, signal?: AbortSignal): Promise<string | undefined> {
+  const mine = loadSite(site)?.site.operations.find((x) => x.name === op.op);
+  if (!mine?.learnedLoggedIn || !mine.readOnly || mine.public?.length || op.errors.length) return undefined;
+  const upload = claimUpload(op);
+  const own = siteOf(new URL(upload.site.baseUrl).hostname);
+  if (!hostsOfOp(upload.operation).every((h) => siteOf(h) === own) || personal(upload).length) return undefined;
+  const fingerprint = sha(fingerprintText(upload.site.name, upload.operation));
+  const body: Claim = {
+    site: { name: upload.site.name, domain: upload.site.domain },
+    fingerprint,
+    nameHash: sha(nameHashText(op.op)),
+  };
+  try {
+    const r = await registryRequest<ClaimResult>("/v1/claims", {
+      method: "POST",
+      body,
+      signed: true,
+      cap: 64 * 1024,
+      signal,
+    });
+    withLock(claimsFile(), () => {
+      const have = readJson<Claimed>(claimsFile(), {});
+      have[fingerprint] = { site, op: op.op, as: upload.site.name };
+      writePrivate(claimsFile(), JSON.stringify(have, null, 1));
+    });
+    await answerClaims(r.wanted, signal);
+  } catch {
+    return undefined;
+  }
+  return fingerprint.slice(0, 12);
+}
+
+/**
+ * The registry asks for the bodies of claims enough installs hold: each goes up in its anonymous form,
+ * but only for a fingerprint this install claimed and that its op still hashes to. The registry's word
+ * that k installs agree is its claim, not this machine's: it gets nothing else.
+ */
+export async function answerClaims(
+  wanted?: ClaimResult["wanted"],
+  signal?: AbortSignal,
+): Promise<{ site: string; op: string; status?: Status; reason?: string }[]> {
+  if (!loadSettings().share) return [];
+  const mine = readJson<Claimed>(claimsFile(), {});
+  if (!Object.keys(mine).length) return [];
+  const asked =
+    wanted ?? (await registryRequest<ClaimResult>("/v1/claims", { signed: true, cap: 64 * 1024, signal })).wanted;
+  const out: { site: string; op: string; status?: Status; reason?: string }[] = [];
+  for (const w of asked) {
+    const held = mine[w.fingerprint];
+    if (!held) continue;
+    let p: ReturnType<typeof plan>;
+    try {
+      p = plan(held.site, { ops: [held.op], evidence: { learnedLoggedIn: true }, ...(held.as ? { as: held.as } : {}) });
+    } catch {
+      continue;
+    }
+    const op = p.ops[0]!;
+    const upload = { ...claimUpload(op), claim: w.fingerprint };
+    if (op.errors.length || sha(fingerprintText(upload.site.name, upload.operation)) !== w.fingerprint) continue;
+    // a name as many installs did not choose is this person's words: it never leaves, not even for the registry to replace
+    if (!w.named) upload.operation = { ...upload.operation, name: `op_${w.fingerprint.slice(0, 8)}` };
+    try {
+      const r = await registryRequest<UploadResult>("/v1/versions", {
+        method: "POST",
+        body: upload,
+        signed: true,
+        cap: 64 * 1024,
+        signal,
+      });
+      record(held.site, held.op, { hash: r.hash, status: r.status });
+      out.push({ site: held.site, op: held.op, status: r.status });
+    } catch (e) {
+      out.push({ site: held.site, op: held.op, reason: (e as Error).message.split("\n")[0] });
+    }
+  }
+  return out;
 }

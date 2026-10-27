@@ -21,6 +21,8 @@ export interface Thresholds {
   recentDays: number;
   uploadsPerHour: number;
   reportsPerHour: number;
+  /** installs, on as many distinct networks, that must claim an op learned signed in before its body is asked for */
+  claimKeys: number;
   /** uploads a key first seen less than an hour ago may make */
   newKeyUploads: number;
   /** uploads an hour across every key: the circuit breaker */
@@ -46,6 +48,7 @@ export function thresholds(env: object): Thresholds {
     reportsPerHour: n("REPORTS_PER_HOUR", 2000),
     newKeyUploads: n("NEW_KEY_UPLOADS", 5),
     uploadsPerHourAll: n("UPLOADS_PER_HOUR_ALL", 300),
+    claimKeys: n("CLAIM_KEYS", 3),
   };
 }
 

@@ -64,7 +64,66 @@ export interface VersionUpload {
   /** the version this one replaces (a heal, or a re-learn of the same op) */
   parent?: string;
   evidence: Evidence;
+  /**
+   * an op learned signed in, sent because enough installs claimed its fingerprint (`Claim`): the
+   * fingerprint, which the operation (in its `anonymous` form) must hash to
+   */
+  claim?: string;
 }
+
+/**
+ * POST /v1/claims (signed): an op learned signed in, by its fingerprint alone. Its body can encode the
+ * person who learned it (an account id in a path, a literal they typed), so it stays on their machine
+ * until installs on enough distinct networks claimed the same fingerprint: identical bytes from strangers
+ * hold no one person's own value. `nameHash` lets the registry keep the op's name only if as many of
+ * them chose it.
+ */
+export interface Claim {
+  site: { name: string; domain: string };
+  /** sha256 hex of `fingerprintText` */
+  fingerprint: string;
+  /** sha256 hex of `nameHashText` */
+  nameHash: string;
+}
+
+/**
+ * The answer to POST and GET /v1/claims: this install's claims that enough installs hold, whose bodies the
+ * registry asks for. `named`: as many of them gave the op the name this install did, so the body may carry
+ * it; otherwise the body goes up as `op_<fingerprint>`, and this install's name never leaves it.
+ */
+export interface ClaimResult {
+  wanted: { site: string; fingerprint: string; named: boolean }[];
+}
+
+/**
+ * An op as it leaves a machine on a claim: none of the words its learner wrote (description, param
+ * descriptions and hints), no examples (their own args), no checks. What stays is the request, the
+ * response recipe and the param names and types: what every install that learned it has alike.
+ */
+export function anonymous(op: Operation): Operation {
+  const {
+    description: _d,
+    checks: _c,
+    unproven: _u,
+    version: _v,
+    learnedAt: _l,
+    ...rest
+  } = op as Operation & {
+    version?: unknown;
+  };
+  return {
+    ...rest,
+    params: op.params.map(({ description: _pd, hint: _h, example: _e, ...p }) => p),
+  } as Operation;
+}
+
+/** The text an op's fingerprint is taken over: its site, then its anonymous form without its name. */
+export const fingerprintText = (site: string, op: Operation) => {
+  const { name: _n, ...rest } = anonymous(op);
+  return `${site}\n${canonical(rest)}`;
+};
+
+export const nameHashText = (name: string) => `name|${name}`;
 
 export interface UploadResult {
   /** sha256 hex of the canonical operation (see `versionHash`) */
