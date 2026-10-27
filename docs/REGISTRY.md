@@ -103,7 +103,9 @@ each of them, on their next claim or `GET /v1/claims`, with the fingerprints it 
 asks at most every 6 hours. A holder then uploads the anonymous op with `claim` set; the site goes up by
 its name, domain and address alone. The registry accepts it only from an install that claimed that
 fingerprint, only in anonymous form, only if it hashes to the fingerprint, and keeps the op's name only
-if as many installs gave it that name (otherwise `op_<fingerprint>`). The client sends a body only for a
+if as many installs gave it that name. Each wanted fingerprint says so (`named`), and when it is false
+the client sends the op as `op_<fingerprint>`: a name only its learner chose never leaves the machine,
+not even for the registry to replace. A claim is answered under the name the site went up under. The client sends a body only for a
 fingerprint it claimed itself and its op still hashes to: that k installs agree is the registry's claim,
 and a registry that asks for anything else gets nothing.
 

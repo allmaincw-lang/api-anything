@@ -86,9 +86,13 @@ export interface Claim {
   nameHash: string;
 }
 
-/** The answer to POST and GET /v1/claims: this install's claims that enough installs hold, whose bodies the registry asks for. */
+/**
+ * The answer to POST and GET /v1/claims: this install's claims that enough installs hold, whose bodies the
+ * registry asks for. `named`: as many of them gave the op the name this install did, so the body may carry
+ * it; otherwise the body goes up as `op_<fingerprint>`, and this install's name never leaves it.
+ */
 export interface ClaimResult {
-  wanted: { site: string; fingerprint: string }[];
+  wanted: { site: string; fingerprint: string; named: boolean }[];
 }
 
 /**

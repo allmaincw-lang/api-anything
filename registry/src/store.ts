@@ -438,20 +438,31 @@ export async function claimsOf(db: D1Database, fingerprint: string): Promise<Cla
 export const holders = (rows: { key: string; network: string }[]) =>
   Math.min(new Set(rows.map((r) => r.key)).size, new Set(rows.map((r) => r.network)).size);
 
-/** This key's claims that `k` installs hold and whose body the registry does not have yet. */
+/**
+ * This key's claims that `k` installs hold and whose body the registry does not have yet, each with
+ * whether `k` of them gave the op this key's name too.
+ */
 export async function wantedClaims(
   db: D1Database,
   key: string,
   k: number,
-): Promise<{ site: string; fingerprint: string }[]> {
+): Promise<{ site: string; fingerprint: string; named: boolean }[]> {
   const { results } = await db
     .prepare(
-      `SELECT c.fingerprint, c.site FROM claims c
+      `SELECT c.fingerprint, c.site, c.name_hash FROM claims c
        WHERE c.key = ? AND NOT EXISTS (SELECT 1 FROM versions v WHERE v.claim = c.fingerprint)`,
     )
     .bind(key)
-    .all<{ fingerprint: string; site: string }>();
+    .all<{ fingerprint: string; site: string; name_hash: string }>();
   const out = [];
-  for (const r of results) if (holders(await claimsOf(db, r.fingerprint)) >= k) out.push(r);
+  for (const r of results) {
+    const all = await claimsOf(db, r.fingerprint);
+    if (holders(all) >= k)
+      out.push({
+        site: r.site,
+        fingerprint: r.fingerprint,
+        named: holders(all.filter((x) => x.name_hash === r.name_hash)) >= k,
+      });
+  }
   return out;
 }
