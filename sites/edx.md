@@ -4,7 +4,7 @@
 
 Each row returns the displayed course `title`, displayed `provider` and absolute frontend `url`. Program and certificate cards are excluded. The initial list is partial. Pagination, the complete catalog, course details, tuition, workload, enrollment and access to course content are outside this operation. A successful listing does not establish that enrollment is open or free. A removed or empty provider page can fail extraction; no reliable empty-provider contract was established.
 
-## Maintainer evidence
+## Maintainer notes
 
 Qualified signed out on 2026-10-26 UTC. Real exact-document browser captures were Harvard `cmvp9nj6ebd5213`, document 1, and edX `cmvp9qelpd6897c`, document 1. Each capture supplied 32 course cards matching an independent HTMLParser audit. Request URLs were `https://www.edx.org/school/harvardx` and `https://www.edx.org/school/edx`; these documents directly contain the returned data. The capture helper limits requests to the exact GET document and does not prove a fully hydrated GUI.
 

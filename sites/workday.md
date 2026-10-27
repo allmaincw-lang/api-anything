@@ -6,7 +6,7 @@ Copy the complete last job segment, including its `JR-` requisition suffix, from
 
 The result contains displayed `title`, primary `location`, optional `additionalLocations`, frontend `timeType` and `remoteType` labels, `jobReqId`, `jobPostingId` and `externalUrl`. Additional locations may be absent. Labels are preserved as supplied; `Flex` is not a guarantee of fully remote work, and `Full Time` is not inferred from schema.org employmentType. The public listing does not prove the position remains open or that an application will be accepted. This operation does not search jobs, paginate a catalog, apply, upload files, access accounts or return the full job description.
 
-## Maintainer evidence
+## Maintainer notes
 
 Qualified signed out on 2026-10-26 UTC. Two genuine frontend captures, `cmvpad1mq` and `cmvpadmig`, supplied the actual public CXS detail requests. Learning examples were the Warsaw technical-support manager role, requisition `JR-0110529`, and the London channel/reseller sales director role, requisition `JR-0110793`. They differ in title, location and requisition. Current saved verification examples are `Technical-Consultant_JR-0110821`, `Web-Designer_JR-0110973` and `Digital-Project-Consultant_JR-0110941`, all linked by the genuine public catalog capture.
 
