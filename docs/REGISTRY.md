@@ -161,6 +161,13 @@ maintainer sets its status (`POST /v1/admin/versions/:hash`), when it:
   heal (above), so the client sends that `fail` report before the upload.
 - Identical repairs from many installs hash the same: each upload of an existing version counts as
   its uploader's confirmation.
+- A repair reaches everyone once it is live. A drifted call of a registry version first asks the
+  registry (`GET /v1/sites/:name`, by the name the registry holds the site under, at most 3 s) for the
+  version it serves for that op now. A different version that is live, keeps the op's match and passes
+  the shared rules is tried before any heal of the client's own, at the tier it asks for if the caller
+  allows it: one request in place of a browser run. Only if it answers does it replace the op where
+  this machine reads it (the rest of the spec untouched). The old version is reported `fail`, the new one `ok`, and
+  nothing is uploaded, since the version is the registry's already.
 - Versions of one op are grouped by its site and op name; each version also stores its match (method,
   host, path, GraphQL operationName). The match alone would merge distinct ops that share an endpoint
   (goodreads `getBook` and `getWorkId` both match `/book/show/*`). The best is served: live over

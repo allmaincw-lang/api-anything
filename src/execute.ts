@@ -40,8 +40,10 @@ import {
   send,
   withDefaults,
 } from "./http.js";
+import { loadSettings } from "./identity.js";
 import { reimportIfBrowser } from "./login.js";
-import { afterCall } from "./report.js";
+import { adopt, servedNow } from "./registry.js";
+import { afterCall, queueReport } from "./report.js";
 import { redact } from "./secrets.js";
 import {
   dropUnbound,
@@ -578,6 +580,15 @@ async function refreshCookies(ctx: Ctx, op: Operation, tier: Tier): Promise<bool
   }
 }
 
+/** The version that answered in place of a drifted one worked: its report, beside the old one's failure. */
+function queueOk(hash: string, a: Attempt): void {
+  try {
+    if (loadSettings().share) queueReport({ hash, outcome: "ok", tier: a.tier });
+  } catch {
+    // a lost report, never a lost answer
+  }
+}
+
 async function onDrift(ctx: Ctx, site: Site, op: Operation, a: Attempt): Promise<Result> {
   const fail = (b: Attempt, extra: Partial<Result> = {}): Result => ({
     ok: false,
@@ -628,6 +639,25 @@ async function onDrift(ctx: Ctx, site: Site, op: Operation, a: Attempt): Promise
       // throttled, challenged or a server failure while checking: stop, don't spend a heal (a browser run) against it
       if (learnedNothing(b)) return fail(b);
       examplesFail = true;
+    }
+  }
+
+  // Another install may have repaired this version already, or it degraded and the registry serves the next
+  // best: that version is one request, a heal is a browser run.
+  if (op.readOnly && op.version) {
+    const next = await servedNow(ctx.site, op).catch(() => undefined);
+    // at the tier the replacement asks for, if the caller allows it: attempt() itself climbs no tier
+    const tier = Math.max(a.tier, next?.minTier ?? 1) as Tier;
+    if (next?.version && tier <= ctx.maxTier && (tier === 1 || browserAvailable())) {
+      const b = await attempt(ctx, next, tier);
+      if (b.class === "ok") {
+        adopt(ctx.site, op, next);
+        queueOk(next.version.hash, b);
+        return success(b, {
+          healed: true,
+          reason: `${a.reason}; the registry now serves another version of ${op.name}, and it answered`,
+        });
+      }
     }
   }
 

@@ -780,3 +780,74 @@ test("shareOps uploads a site under the name the registry serves its domain unde
   assert.equal(fake.uploads()[1]!.site.name, "example-com");
   fake.matches = [];
 });
+
+/* ------------------------------------------------- another install's fix */
+
+/** The site renamed its search param from q to query: a version still sending q gets no list. */
+const renamed = (async (input: string | URL | Request) => {
+  const u = new URL(String(input));
+  if (!u.pathname.startsWith("/api/search")) return new Response("", { status: 404 });
+  const q = u.searchParams.get("query");
+  return q ? json({ hits: [{ q }] }) : json({ message: "missing query" });
+}) as typeof fetch;
+
+/** The repair as the registry serves it, under the name it holds the site by: example-com for a site learned here as demo. */
+const repaired = (status: "live" | "candidate" = "live", op: Record<string, unknown> = {}) =>
+  served(
+    site(
+      {
+        request: { method: "GET", url: "https://www.example.com/api/search?query=kittens", headers: {} },
+        slots: [{ param: "q", at: ["query:query"] }],
+        ...op,
+      },
+      { name: "example-com" },
+    ),
+    undefined,
+    status,
+  );
+
+test("a drifted registry version takes the version the registry serves now, before any heal of its own", async () => {
+  shareOn();
+  const parent = "d".repeat(64);
+  saveSite(site({ version: { hash: parent, status: "live" } }));
+  const fix = repaired();
+  // learned here as demo, shared as example-com: the repair is asked for by the registry's name
+  fake.sites.set("example-com", fix);
+  const r = await call("demo", "search", { q: "bob" }, { maxTier: 1, minIntervalMs: 0, fetchImpl: renamed });
+  assert.equal(r.ok, true, JSON.stringify(r));
+  assert.equal(r.healed, true);
+  assert.match(r.reason!, /the registry now serves another version of search/);
+  assert.deepEqual(r.data, [{ q: "bob" }]);
+  const now = loadSite("demo")!.site.operations[0]!;
+  assert.deepEqual(now.version, { hash: fix.operations[0]!.hash, status: "live" });
+  await settle(5000);
+  assert.deepEqual(
+    fake
+      .reports()
+      .map((x) => [x.hash, x.outcome])
+      .sort(),
+    [
+      [parent, "fail"],
+      [fix.operations[0]!.hash, "ok"],
+    ].sort(),
+  );
+  assert.equal(uploads().length, 0, "the registry's own version is not shared back as a heal");
+});
+
+test("the registry's version is not taken when it is no live one, sends to another endpoint, or needs a tier the caller does not allow", async () => {
+  shareOn();
+  const parent = "e".repeat(64);
+  for (const fix of [
+    repaired("candidate"),
+    repaired("live", { match: { host: "www.example.com", path: "/api/find" } }),
+    // it needs the browser's page fetch, and the caller allows plain HTTP only
+    repaired("live", { minTier: 2 }),
+  ]) {
+    saveSite(site({ version: { hash: parent, status: "live" } }));
+    fake.sites.set("example-com", fix);
+    const r = await call("demo", "search", { q: "bob" }, { maxTier: 1, minIntervalMs: 0, fetchImpl: renamed });
+    assert.equal(r.ok, false);
+    assert.equal(loadSite("demo")!.site.operations[0]!.version?.hash, parent, "the op is as it was");
+  }
+  await settle(2000);
+});
