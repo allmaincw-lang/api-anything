@@ -466,3 +466,33 @@ export async function wantedClaims(
   }
   return out;
 }
+
+/* ------------------------------------------------------------------ demand */
+
+export const wantDomain = (db: D1Database, domain: string, network: string, now: string) =>
+  db
+    .prepare(
+      "INSERT INTO demand (domain, network, at) VALUES (?, ?, ?) ON CONFLICT (domain, network) DO UPDATE SET at = excluded.at",
+    )
+    .bind(domain, network, now)
+    .run();
+
+/** Domains asked for since `since` that no shared site answers yet, by how many networks asked. */
+export async function demandList(
+  db: D1Database,
+  since: string,
+  limit: number,
+): Promise<{ domain: string; networks: number; lastAt: string }[]> {
+  const { results } = await db
+    .prepare(
+      `SELECT d.domain, COUNT(*) AS networks, MAX(d.at) AS lastAt FROM demand d
+       WHERE d.at >= ? AND NOT EXISTS (SELECT 1 FROM sites s WHERE s.domain = d.domain)
+       GROUP BY d.domain ORDER BY networks DESC, lastAt DESC LIMIT ?`,
+    )
+    .bind(since, limit)
+    .all<{ domain: string; networks: number; lastAt: string }>();
+  return results;
+}
+
+export const forgetDemand = (db: D1Database, before: string) =>
+  db.prepare("DELETE FROM demand WHERE at < ?").bind(before).run();

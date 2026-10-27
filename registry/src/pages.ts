@@ -175,6 +175,10 @@ form.search button{font:inherit;font-size:16px;color:#fff;background:var(--accen
 .sites strong{font-size:17px}
 .sites p{margin:4px 0 0;color:var(--muted);font-size:15px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
 .sites .meta{white-space:nowrap;display:flex;gap:8px;align-items:center;font-size:13px;color:var(--muted)}
+.wanted{list-style:none;margin:12px 0 0;padding:0;border:1px solid var(--line);border-radius:14px;background:var(--card)}
+.wanted li{display:flex;justify-content:space-between;gap:12px;padding:10px 18px;border-top:1px solid var(--line)}
+.wanted li:first-child{border-top:0}
+.wanted .meta{font-size:13px;color:var(--muted);white-space:nowrap}
 table.ops{width:100%;border-collapse:collapse;font-size:15px}
 .ops th{text-align:left;font-size:13px;font-weight:600;color:var(--muted);border-bottom:1px solid var(--line);padding:8px 10px}
 .ops td{border-bottom:1px solid var(--line);padding:12px 10px;vertical-align:top}
@@ -241,7 +245,12 @@ const clip = (s: string, n: number) => (s.length > n ? `${s.slice(0, n - 1).trim
 /* ------------------------------------------------------------------ pages */
 
 /** `sites` in the order to list them: every site, or a query's matches best first. */
-export function homePage(sites: ServedSite[], origin: string, query?: string): string {
+export function homePage(
+  sites: ServedSite[],
+  origin: string,
+  query?: string,
+  demand: { domain: string; networks: number }[] = [],
+): string {
   const rows = sites.map((s) => {
     const h = summary(s);
     const n = s.operations.length;
@@ -260,7 +269,14 @@ ${command(esc(INSTALL))}
 <p class="note">Operations other installs learned. Each is checked by the installs that call it: live means installs other than its uploader confirmed it works.</p>
 <form class="search" method="get" action="/#sites" role="search"><input id="q" name="q" type="search" placeholder="Search: book ratings, flight prices…" aria-label="Search shared sites" autocomplete="off" value="${esc(query ?? "")}"><button type="submit">Search</button></form>
 ${query ? `<p class="note">${sites.length} match${sites.length === 1 ? "" : "es"} for “${esc(query)}” · <a href="/#sites">all sites</a></p>` : ""}
-${rows.length ? `<ul class="sites" id="site-list">\n${rows.join("\n")}\n</ul>` : `<p class="note">${none}</p>`}`;
+${rows.length ? `<ul class="sites" id="site-list">\n${rows.join("\n")}\n</ul>` : `<p class="note">${none}</p>`}
+${
+  demand.length
+    ? `<h2 id="wanted">Asked for, not shared yet</h2>
+<p class="note">Sites agents looked for in the last 30 days that nobody has shared, by how many networks asked. Teaching one to your agent shares it with all of them.</p>
+<ul class="wanted">${demand.map((d) => `<li><span>${esc(d.domain)}</span><span class="meta">${d.networks} network${d.networks === 1 ? "" : "s"}</span></li>`).join("")}</ul>`
+    : ""
+}`;
   return layout({
     title: "API Anything: call any website like an API from your agent",
     description: `${TAGLINE} Shared, unofficial APIs for ${sites.slice(0, 6).map(titleOf).join(", ")} and more.`,

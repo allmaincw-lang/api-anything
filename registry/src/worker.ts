@@ -11,6 +11,7 @@ import {
   type UploadResult,
   type VerifyJob,
 } from "../../src/registry-api.js";
+import { domainOf } from "../../src/search.js";
 import type { Operation } from "../../src/spec.js";
 import { networksOf, sha256Hex, signatureHeaders, signer } from "./auth.js";
 import { catalog, confirmed, entryOf, search } from "./catalog.js";
@@ -25,8 +26,10 @@ import {
   claimsOf,
   count,
   type D1Database,
+  demandList,
   facts,
   failedOn,
+  forgetDemand,
   getKey,
   getSite,
   getVersion,
@@ -43,6 +46,7 @@ import {
   unverified,
   type VersionRow,
   versionsIn,
+  wantDomain,
   wantedClaims,
 } from "./store.js";
 import {
@@ -201,13 +205,28 @@ async function recompute(c: Ctx, v: VersionRow): Promise<Status> {
 
 /* ------------------------------------------------------------------ reads */
 
-function searchApi(c: Ctx) {
+async function searchApi(c: Ctx) {
   const q = c.url.searchParams.get("q")?.trim();
   if (!q) throw new HttpError(400, "search takes q: words, a domain or a URL");
   const limit = Math.min(Math.max(Number(c.url.searchParams.get("limit")) || 5, 1), 20);
-  return keyOf(c, false)
-    .then((viewer) => catalog(c.env.DB, c.since, viewer))
-    .then((sites) => json({ matches: search(sites, q, limit) }));
+  const sites = await catalog(c.env.DB, c.since, await keyOf(c, false));
+  const matches = search(sites, q, limit);
+  // a site agents want and nobody shared: its domain, never the words of a search
+  const domain = matches.length ? undefined : domainOf(q);
+  if (domain) {
+    const { network } = await networksOf(c.request, salt(c));
+    await wantDomain(c.env.DB, domain, network, new Date(c.now).toISOString());
+    // not cached: the next network asking for it is counted too
+    return json({ matches }, 200, { "cache-control": "no-store" });
+  }
+  return json({ matches });
+}
+
+const DEMAND_DAYS = 30;
+
+async function demandApi(c: Ctx) {
+  const since = new Date(c.now - DEMAND_DAYS * DAY).toISOString();
+  return json({ demand: await demandList(c.env.DB, since, 50) });
 }
 
 async function siteApi(c: Ctx, name: string) {
@@ -493,7 +512,15 @@ async function home(c: Ctx) {
   const sites = await catalog(c.env.DB, c.since);
   const q = c.url.searchParams.get("q")?.trim();
   // a site nobody but its uploader vouched for may say it is any brand: it is reached by name or domain only
-  if (!q) return html(homePage(sites.filter(confirmed), c.url.origin));
+  if (!q)
+    return html(
+      homePage(
+        sites.filter(confirmed),
+        c.url.origin,
+        undefined,
+        await demandList(c.env.DB, new Date(c.now - DEMAND_DAYS * DAY).toISOString(), 10),
+      ),
+    );
   const byName = new Map(sites.map((s) => [s.name, s]));
   const found = search(sites, q, 20).map((m) => byName.get(m.name)!);
   return html(homePage(found, c.url.origin, q));
@@ -526,6 +553,7 @@ const ROUTES: [method: string, path: RegExp, handler: Handler, auth?: Auth, maxB
   ["GET", /^\/v1\/search$/, searchApi],
   ["GET", new RegExp(`^/v1/sites/${NAME}$`), siteApi],
   ["GET", /^\/v1\/index$/, indexApi],
+  ["GET", /^\/v1\/demand$/, demandApi],
   ["GET", /^\/v1\/verify-jobs$/, verifyJobs, "signed"],
   ["POST", /^\/v1\/versions$/, upload, "signed"],
   ["POST", /^\/v1\/reports$/, reports, "signed"],
@@ -568,7 +596,7 @@ interface EdgeCache {
 const edgeCache = () => (globalThis as { caches?: { default?: EdgeCache } }).caches?.default;
 
 /** Public reads, the same for every unsigned caller: cached 60 s by URL. */
-const CACHED = new RegExp(`^/(v1/search|v1/sites/${NAME}|v1/index|sites/${NAME}/?|sitemap\\.xml)?$`);
+const CACHED = new RegExp(`^/(v1/search|v1/sites/${NAME}|v1/index|v1/demand|sites/${NAME}/?|sitemap\\.xml)?$`);
 const CACHE_SECONDS = 60;
 
 function cacheable(request: Request): boolean {
@@ -596,7 +624,7 @@ export default {
     const hit = await cache?.match(key);
     if (hit) return hit;
     const res = await answer(request, env);
-    if (!cache || res.status !== 200) return res;
+    if (!cache || res.status !== 200 || res.headers.get("cache-control") === "no-store") return res;
     res.headers.set("cache-control", `public, max-age=${CACHE_SECONDS}`);
     const put = cache.put(key, res.clone());
     if (ctx) ctx.waitUntil(put);
@@ -619,6 +647,7 @@ export default {
       Math.floor(now / HOUR),
       new Date(now - 30 * DAY).toISOString(),
     );
+    await forgetDemand(env.DB, new Date(now - 90 * DAY).toISOString());
     console.log(`archived ${gone.length} versions`);
   },
 };

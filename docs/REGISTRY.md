@@ -26,7 +26,8 @@ The answer is `settings.json` `share: true|false` (default yes). No account. Wha
 `find_sites` sends its words, domain or URL to `GET /v1/search` whether sharing is on or off (the
 local specs are searched too, and answer alone when the registry cannot be reached), and so does a
 call of a site this machine lacks, which fetches it. The registry sees the request's IP address, as any
-web server does, and does not store it.
+web server does, and does not store it. Of a domain or URL search that finds nothing, it keeps the
+registrable domain and the hashed network that asked (demand, below), never the words of a search.
 
 ## Using an operation that exists
 
@@ -87,6 +88,15 @@ web server does, and does not store it.
    under its own name when it is pulled or bundled or the registry serves its domain under that name,
    and otherwise under the slug, which the outcome's `as` names (`publish.ts` `registryName`,
    `uploadName`).
+
+## Demand
+
+What agents looked for and nobody shared is the list of what to learn next. A `GET /v1/search` for a
+domain or a URL that matches no site records that query's registrable domain with the hashed network
+that asked; words are never recorded, since they are a person's and the list is public. `GET /v1/demand`
+(cached 60 s) and the home page list the domains asked for in the last 30 days that no site covers yet,
+by how many distinct networks asked, so one network asking a thousand times counts once. A domain
+leaves the list once a site for it is shared; the daily job deletes records older than 90 days.
 
 ## Ops learned signed in
 
@@ -252,10 +262,10 @@ D1 tables: `sites` (name, domain, display fields, notes, first uploader), `versi
 op name, match signature, operation JSON, parent, status, uploader and its network hash, evidence,
 timestamps including when it first went live), `reports`
 (hash, key, network hash, outcome, tier, at), `keys` (public key, first seen, counts), `rates` (hourly
-counters, kept for a day), `claims` (fingerprint, site, key, network hash, name hash, at). No args, no
-response data, no IP addresses.
+counters, kept for a day), `claims` (fingerprint, site, key, network hash, name hash, at), `demand`
+(registrable domain, network hash, at; deleted after 90 days). No args, no response data, no IP addresses.
 
 About the caller, the registry keeps its reports, keyed by install key and time, and nothing else:
 no account, no IP address (a network is a salted hash, used to count distinct networks and for rate
-limits), no search queries. Workers observability logs are off (`registry/wrangler.jsonc`), so request
+limits), no search words. Workers observability logs are off (`registry/wrangler.jsonc`), so request
 URLs, and the queries in them, are not stored.
