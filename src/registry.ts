@@ -329,6 +329,9 @@ const FoundOpSchema = z.object({
     )
     .max(50),
 });
+/** interfaces kept per match: more are dropped, never the match */
+const MAX_INTERFACES = 10;
+
 const InterfaceSchema = z.object({
   kind: z.enum(["mcp", "openapi"]),
   url: z
@@ -347,13 +350,14 @@ const SearchMatchSchema = z.object({
   // a malformed interface is dropped, not the match
   interfaces: z
     .array(z.unknown())
-    .max(10)
     .optional()
     .transform((list) =>
-      list?.flatMap((x) => {
-        const p = InterfaceSchema.safeParse(x);
-        return p.success ? [p.data] : [];
-      }),
+      list
+        ?.flatMap((x) => {
+          const p = InterfaceSchema.safeParse(x);
+          return p.success ? [p.data] : [];
+        })
+        .slice(0, MAX_INTERFACES),
     ),
 });
 
@@ -470,8 +474,16 @@ export async function search(
   }
   const local = o.local ?? localSites();
   const installed = new Set(local.map((s) => s.name));
+  // a site already here keeps its own operations, and gains the interfaces the registry knows for its domain
+  const remoteInterfaces = new Map(
+    remote.flatMap((m) => (m.interfaces?.length ? [[m.domain, m.interfaces] as const] : [])),
+  );
+  const withInterfaces = (f: Found): Found => {
+    const own = remoteInterfaces.get(f.domain);
+    return own ? { ...f, interfaces: own } : f;
+  };
   const scored = [
-    ...local.map((s) => ({ found: localFound(s), s: score(indexEntry(s, ""), query), local: true })),
+    ...local.map((s) => ({ found: withInterfaces(localFound(s)), s: score(indexEntry(s, ""), query), local: true })),
     ...remote
       .filter((m) => !installed.has(m.name))
       .map((m) => ({

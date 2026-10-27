@@ -970,3 +970,23 @@ test("search passes on a site's own interfaces, and drops a malformed one withou
     fake.matches = [];
   }
 });
+
+test("an installed site shows the interfaces the registry knows for its domain, and an eleventh interface drops no match", async () => {
+  const { search } = await import("../src/registry.js");
+  const many = Array.from({ length: 12 }, (_, i) => ({
+    kind: "mcp" as const,
+    url: `https://mcp${i}.example.com/sse`,
+    confirmations: 2,
+  }));
+  fake.matches = [{ name: "example-com", domain: "example.com", operations: [], interfaces: many }];
+  try {
+    const r = await search("example.com", { local: [site()] });
+    const here = r.matches.find((m) => m.site === "demo");
+    assert.ok(here, "the installed site is still the match");
+    assert.equal(here!.installed, true);
+    assert.equal(here!.operations[0]!.name, "search", "its own operations stay");
+    assert.equal(here!.interfaces?.length, 10, "at most ten, the rest dropped, not the match");
+  } finally {
+    fake.matches = [];
+  }
+});

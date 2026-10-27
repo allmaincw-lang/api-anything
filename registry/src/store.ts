@@ -539,5 +539,7 @@ export async function interfacesOf(
     const { domain, kind } = rows[0]!;
     out.set(domain, [...(out.get(domain) ?? []), { kind, url, confirmations: n }]);
   }
+  // the best confirmed ten a domain has: what the client keeps
+  for (const [d, list] of out) out.set(d, list.sort((a, b) => b.confirmations - a.confirmations).slice(0, 10));
   return out;
 }

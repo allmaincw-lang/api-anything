@@ -105,8 +105,10 @@ mcp|openapi <url>` reports one (`POST /v1/interfaces`, signed): https on a publi
 registrable domain. Once installs on as many distinct networks as promote a version (`PROMOTE_KEYS`,
 `PROMOTE_NETWORKS`) reported it, `GET /v1/sites/:name` and search list it as `interfaces` beside that
 domain's operations. A domain search finds a domain that has only an interface, as a match with no
-operations, and records no demand for it. The agent tells the user; nothing in the client calls an
-interface.
+operations, and records no demand for it. A site already installed keeps its own operations in the
+answer and gains its domain's interfaces. At most ten are served per domain, the best confirmed first;
+the client drops any more, or any malformed one, never the match. The agent tells the user; nothing in
+the client calls an interface.
 
 ## Ops learned signed in
 
