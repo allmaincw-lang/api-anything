@@ -223,9 +223,10 @@ const sameMatch = (a: Operation, b: Operation) =>
 /**
  * A drifted op that is a registry version: the version the registry serves for it now, when that is
  * another live one with the same match (another install's repair, promoted, or the next best after this
- * one degraded). It replaces the op where this machine reads it, the rest of the spec untouched, and is
- * returned for the call to try: one request in place of a browser heal. Undefined when the registry
- * serves nothing else, cannot be reached in 3 s, or serves something the shared rules refuse.
+ * one degraded), returned for the call to try: one request in place of a browser heal. Nothing is saved
+ * until it answers (`adopt`). It is asked for by the name the registry holds the site under. Undefined
+ * when the registry serves nothing else, cannot be reached in 3 s, or serves something the shared rules
+ * refuse.
  */
 export async function servedNow(
   name: string,
@@ -237,18 +238,19 @@ export async function servedNow(
   const r = loadSite(name);
   if (!r || r.source === "bundled") return undefined;
   let served: ServedSite;
+  let site: Site;
   try {
-    served = await registryRequest<ServedSite>(`/v1/sites/${name}`, {
+    // the name the registry holds the site under, which a site learned here may not share (demo as example-com)
+    const { uploadName } = await import("./publish.js");
+    const as = await uploadName(name, {
+      signal: AbortSignal.any([AbortSignal.timeout(SERVED_NOW_MS), ...(o.signal ? [o.signal] : [])]),
+    });
+    served = await registryRequest<ServedSite>(`/v1/sites/${as}`, {
       cap: LIMITS.file + LIMITS.notes + 64 * 1024,
       timeoutMs: SERVED_NOW_MS,
       signal: o.signal,
     });
-  } catch {
-    return undefined;
-  }
-  let site: Site;
-  try {
-    site = siteFrom(name, served);
+    site = siteFrom(as, served);
   } catch {
     return undefined;
   }
@@ -257,10 +259,17 @@ export async function servedNow(
   if (!next.readOnly || !sameMatch(op, next)) return undefined;
   if (vetShared({ ...r.site, operations: [next] }).errors.length) return undefined;
   if (siteOf(new URL(site.baseUrl).hostname) !== siteOf(new URL(r.site.baseUrl).hostname)) return undefined;
+  return next;
+}
+
+/** The registry's version answered in place of a drifted op: it replaces that op where this machine reads it, the rest of the spec untouched. */
+export function adopt(name: string, op: Operation, next: Operation): void {
+  name = safeName(name);
+  const r = loadSite(name);
+  if (!r) return;
   const swap = (s: Site): Site => ({ ...s, operations: s.operations.map((x) => (x.name === op.name ? next : x)) });
   if (r.source === "registry") writePrivate(r.path, `${JSON.stringify(swap(r.site), null, 2)}\n`);
   else updateSite(name, (cur) => swap(cur ?? r.site));
-  return next;
 }
 
 const upgradesFile = () => join(home(), "upgrades.json");
