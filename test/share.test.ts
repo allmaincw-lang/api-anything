@@ -797,13 +797,17 @@ const renamed = (async (input: string | URL | Request) => {
   return q ? json({ hits: [{ q }] }) : json({ message: "missing query" });
 }) as typeof fetch;
 
+/** The repair as the registry serves it, under the name it holds the site by: example-com for a site learned here as demo. */
 const repaired = (status: "live" | "candidate" = "live", op: Record<string, unknown> = {}) =>
   served(
-    site({
-      request: { method: "GET", url: "https://www.example.com/api/search?query=kittens", headers: {} },
-      slots: [{ param: "q", at: ["query:query"] }],
-      ...op,
-    }),
+    site(
+      {
+        request: { method: "GET", url: "https://www.example.com/api/search?query=kittens", headers: {} },
+        slots: [{ param: "q", at: ["query:query"] }],
+        ...op,
+      },
+      { name: "example-com" },
+    ),
     undefined,
     status,
   );
@@ -813,7 +817,8 @@ test("a drifted registry version takes the version the registry serves now, befo
   const parent = "d".repeat(64);
   saveSite(site({ version: { hash: parent, status: "live" } }));
   const fix = repaired();
-  fake.sites.set("demo", fix);
+  // learned here as demo, shared as example-com: the repair is asked for by the registry's name
+  fake.sites.set("example-com", fix);
   const r = await call("demo", "search", { q: "bob" }, { maxTier: 1, minIntervalMs: 0, fetchImpl: renamed });
   assert.equal(r.ok, true, JSON.stringify(r));
   assert.equal(r.healed, true);
@@ -835,15 +840,17 @@ test("a drifted registry version takes the version the registry serves now, befo
   assert.equal(uploads().length, 0, "the registry's own version is not shared back as a heal");
 });
 
-test("the registry's version is not taken when it is no live one, or sends to another endpoint", async () => {
+test("the registry's version is not taken when it is no live one, sends to another endpoint, or needs a tier the caller does not allow", async () => {
   shareOn();
   const parent = "e".repeat(64);
   for (const fix of [
     repaired("candidate"),
     repaired("live", { match: { host: "www.example.com", path: "/api/find" } }),
+    // it needs the browser's page fetch, and the caller allows plain HTTP only
+    repaired("live", { minTier: 2 }),
   ]) {
     saveSite(site({ version: { hash: parent, status: "live" } }));
-    fake.sites.set("demo", fix);
+    fake.sites.set("example-com", fix);
     const r = await call("demo", "search", { q: "bob" }, { maxTier: 1, minIntervalMs: 0, fetchImpl: renamed });
     assert.equal(r.ok, false);
     assert.equal(loadSite("demo")!.site.operations[0]!.version?.hash, parent, "the op is as it was");
