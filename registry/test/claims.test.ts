@@ -40,8 +40,10 @@ test("the body is asked for once three installs on three networks claim the same
   );
   await send(env, "POST", "/v1/claims", { as: b, ip: "192.0.2.44", body: claimOf() });
   const third = await send(env, "POST", "/v1/claims", { as: c, ip: "203.0.113.80", body: claimOf() });
-  assert.deepEqual(third.body.wanted, [{ site: site.name, fingerprint }]);
-  assert.deepEqual((await send(env, "GET", "/v1/claims", { as: a })).body.wanted, [{ site: site.name, fingerprint }]);
+  assert.deepEqual(third.body.wanted, [{ site: site.name, fingerprint, named: true }]);
+  assert.deepEqual((await send(env, "GET", "/v1/claims", { as: a })).body.wanted, [
+    { site: site.name, fingerprint, named: true },
+  ]);
   assert.deepEqual(
     (await send(env, "GET", "/v1/claims", { as: d })).body.wanted,
     [],
@@ -84,7 +86,9 @@ test("an answer must be the anonymous op the fingerprint names, and a name one p
   const [a, b, c] = [install(), install(), install()];
   await send(env, "POST", "/v1/claims", { as: a, ip: "198.51.100.7", body: claimOf("charlesList") });
   await send(env, "POST", "/v1/claims", { as: b, ip: "192.0.2.44", body: claimOf() });
-  await send(env, "POST", "/v1/claims", { as: c, ip: "203.0.113.80", body: claimOf("myBooks") });
+  const asked = await send(env, "POST", "/v1/claims", { as: c, ip: "203.0.113.80", body: claimOf("myBooks") });
+  // asked for, but under no name of this install's: three installs did not agree on one
+  assert.deepEqual(asked.body.wanted, [{ site: site.name, fingerprint, named: false }]);
   const worded = await send(env, "POST", "/v1/versions", { as: a, ip: "198.51.100.7", body: answer(signedIn) });
   assert.match(worded.body.reasons[0], /anonymous form/);
   const other = anonymous(

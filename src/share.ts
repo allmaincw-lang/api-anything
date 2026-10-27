@@ -187,7 +187,8 @@ export async function healBack(
 /* --------------------------------------------------- ops learned signed in */
 
 const claimsFile = () => join(home(), "claims.json");
-type Claimed = Record<string, { site: string; op: string }>;
+/** each claimed fingerprint: the local site and op, and the name the site went up under (`as`) */
+type Claimed = Record<string, { site: string; op: string; as?: string }>;
 
 const sha = (text: string) => createHash("sha256").update(text).digest("hex");
 
@@ -229,7 +230,7 @@ async function claim(site: string, op: OpPlan, signal?: AbortSignal): Promise<st
     });
     withLock(claimsFile(), () => {
       const have = readJson<Claimed>(claimsFile(), {});
-      have[fingerprint] = { site, op: op.op };
+      have[fingerprint] = { site, op: op.op, as: upload.site.name };
       writePrivate(claimsFile(), JSON.stringify(have, null, 1));
     });
     await answerClaims(r.wanted, signal);
@@ -259,13 +260,15 @@ export async function answerClaims(
     if (!held) continue;
     let p: ReturnType<typeof plan>;
     try {
-      p = plan(held.site, { ops: [held.op], evidence: { learnedLoggedIn: true } });
+      p = plan(held.site, { ops: [held.op], evidence: { learnedLoggedIn: true }, ...(held.as ? { as: held.as } : {}) });
     } catch {
       continue;
     }
     const op = p.ops[0]!;
     const upload = { ...claimUpload(op), claim: w.fingerprint };
     if (op.errors.length || sha(fingerprintText(upload.site.name, upload.operation)) !== w.fingerprint) continue;
+    // a name as many installs did not choose is this person's words: it never leaves, not even for the registry to replace
+    if (!w.named) upload.operation = { ...upload.operation, name: `op_${w.fingerprint.slice(0, 8)}` };
     try {
       const r = await registryRequest<UploadResult>("/v1/versions", {
         method: "POST",

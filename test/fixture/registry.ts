@@ -71,7 +71,7 @@ export async function startRegistry() {
     matches: [] as SearchMatch[],
     jobs: [] as VerifyJob[],
     /** what POST and GET /v1/claims answer as wanted */
-    wanted: [] as { site: string; fingerprint: string }[],
+    wanted: [] as { site: string; fingerprint: string; named: boolean }[],
     /** raw answers by path, ahead of everything else: for answers the contract does not allow */
     raw: new Map<string, { status: number; body: string; headers?: Record<string, string> }>(),
     /** every request answers 503 */
