@@ -40,3 +40,22 @@ test("a domain leaves the list once a site for it is shared, and the home page s
     ["example.org"],
   );
 });
+
+test("at the edge, a search that recorded demand is not cached, so every network asking is counted", async () => {
+  const { env } = registry();
+  const store = new Map<string, Response>();
+  const g = globalThis as { caches?: unknown };
+  g.caches = {
+    default: {
+      match: async (r: Request) => store.get(r.url)?.clone(),
+      put: async (r: Request, res: Response) => void store.set(r.url, res),
+    },
+  };
+  try {
+    for (const ip of ["198.51.100.7", "192.0.2.44", "203.0.113.80"]) await search(env, "zillow.com", ip);
+    const r = await send(env, "GET", "/v1/demand");
+    assert.equal(r.body.demand[0].networks, 3);
+  } finally {
+    delete g.caches;
+  }
+});

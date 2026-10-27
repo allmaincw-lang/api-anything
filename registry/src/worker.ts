@@ -216,6 +216,8 @@ async function searchApi(c: Ctx) {
   if (domain) {
     const { network } = await networksOf(c.request, salt(c));
     await wantDomain(c.env.DB, domain, network, new Date(c.now).toISOString());
+    // not cached: the next network asking for it is counted too
+    return json({ matches }, 200, { "cache-control": "no-store" });
   }
   return json({ matches });
 }
@@ -622,7 +624,7 @@ export default {
     const hit = await cache?.match(key);
     if (hit) return hit;
     const res = await answer(request, env);
-    if (!cache || res.status !== 200) return res;
+    if (!cache || res.status !== 200 || res.headers.get("cache-control") === "no-store") return res;
     res.headers.set("cache-control", `public, max-age=${CACHE_SECONDS}`);
     const put = cache.put(key, res.clone());
     if (ctx) ctx.waitUntil(put);
