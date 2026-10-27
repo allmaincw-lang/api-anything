@@ -291,6 +291,7 @@ describe("e2e", { skip: !browserAvailable() && "no Chromium browser installed" }
       const tools = await client.listTools();
       assert.deepEqual(tools.tools.map((t) => t.name).sort(), [
         "call_operation",
+        "find_sites",
         "get_job",
         "list_operations",
         "list_sites",

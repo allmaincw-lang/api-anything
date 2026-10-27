@@ -37,6 +37,7 @@
     "lint": "biome ci .",
     "format": "biome check --write .",
     "demo": "node examples/research.mjs",
+    "pages": "tsx scripts/pages.ts",
     "smoke:pack": "node --import tsx test/smoke-pack.ts"
   },
   "keywords": [

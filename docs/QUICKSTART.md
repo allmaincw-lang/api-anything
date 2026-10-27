@@ -68,10 +68,10 @@ them. A client started from the Dock or a menu may not get your shell's `PATH`, 
 `API_ANYTHING_BROWSER` are copied into the entry when you have them set.
 
 Restart the agent session. Ask it to list API Anything sites, then search Hacker News for sqlite.
-It should discover `list_sites`, `list_operations`, `call_operation`, `get_job` and `login`, and use
-`call_operation` with `site: "hacker-news"`, `op: "search"`, `args: {"query":"sqlite"}`. A server
-started with `--allow-writes` adds `call_write_operation`. See the
-[official MCP setup instructions](https://developers.openai.com/codex/mcp).
+It should discover `list_sites`, `find_sites`, `list_operations`, `call_operation`, `get_job` and
+`login`, and use `call_operation` with `site: "hacker-news"`, `op: "search"`,
+`args: {"query":"sqlite"}`. A server started with `--allow-writes` adds `call_write_operation`. See
+the [official MCP setup instructions](https://developers.openai.com/codex/mcp).
 
 `api-anything mcp --sites goodreads,hacker-news` also serves each operation of those sites as a tool
 of its own (`goodreads__searchBooks`), with its arguments' schema, so the agent skips

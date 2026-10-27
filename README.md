@@ -168,7 +168,8 @@ Pull what someone else learned. Publish yours as a pull request, after the same 
 | tool | what it does |
 |---|---|
 | `list_sites` | the sites, with how many operations each has |
-| `list_operations` | a site's operations, each with a JSON Schema of its args, and the site's notes |
+| `find_sites` | search the shared registry by what you need, a domain or a URL |
+| `list_operations` | a site's operations, each with a JSON Schema of its args, and the site's notes; pulls a shared site it doesn't have yet, with its reads only |
 | `call_operation` | call a read; it never sends a write |
 | `call_write_operation` | call a write; exists only on a server started with `--allow-writes` |
 | `get_job` | the result of a call that was still running after about 25 s |
@@ -293,10 +294,12 @@ search, book details, an author's books and reviews.
 
 ## Share specs
 
-Someone may have learned the site already. `pull` fetches a spec from the registry (this
-repository's [`sites/`](sites/)) and checks it against the shared rules first:
+Someone may have learned the site already. `search` looks through the registry (this repository's
+[`sites/`](sites/)) by what you need, a domain or a URL, and `pull` fetches a spec, checked against
+the shared rules first:
 
 ```sh
+api-anything search book ratings        # or goodreads.com, or a page's URL
 api-anything pull goodreads
 api-anything call goodreads searchBooks q=piranesi
 ```

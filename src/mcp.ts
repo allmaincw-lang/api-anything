@@ -3,8 +3,9 @@
  * adds one tool per op of the sites named. Reads and writes are separate tools, so each carries hints
  * a client can act on: a read is never advertised as destructive. Writes are hidden and refused
  * unless started with allowWrites. A call still running at the deadline answers with a job (jobs.ts).
- * It cannot create operations (that is the CLI's capture/add), and its login cannot import cookies
- * a human did not already choose to import: page content may be steering the agent.
+ * It cannot learn operations (that is the CLI's capture/add), but it finds and pulls reviewed shared
+ * specs, whose writes it never offers: page content may be steering the agent. For the same reason its
+ * login cannot import cookies a human did not already choose to import.
  */
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
@@ -25,6 +26,7 @@ import {
   windowLogin,
   windowRetry,
 } from "./login.js";
+import { type IndexCache, type Pulled, pull, search } from "./registry.js";
 import type { Operation, Paging, Param } from "./spec.js";
 import { listSites, loadSite, siteNotes } from "./store.js";
 import { SHARED_NOTE } from "./vet.js";
@@ -115,6 +117,8 @@ export function mcpNext(next: string): string {
     .replace(/rerun with --allow-writes \(MCP: [^)]*\)/, "ask the user to restart this MCP server with --allow-writes")
     .replace(/api-anything ops ([\w.-]+)/g, 'list_operations {"site":"$1"}')
     .replace(/api-anything sites/g, "list_sites")
+    .replace(/api-anything search ([\w.-]+)/g, 'find_sites {"query":"$1"}')
+    .replace(/api-anything pull ([\w.-]+)/g, 'list_operations {"site":"$1"} (it pulls a shared site)')
     .replace(
       /(?:ask the user to run:? )?api-anything login ([\w.-]+)/g,
       'the login tool {"site":"$1"} (mode "window" when the user must sign in or clear a challenge by hand)',
@@ -175,6 +179,37 @@ export function asTable(data: unknown): unknown {
   const table = { columns, rows: data.map((x) => columns.map((c) => (Object.hasOwn(x, c) ? x[c] : null))) };
   return JSON.stringify(table).length < sourceSize ? table : data;
 }
+
+/**
+ * A site an agent pulled over MCP: its writes stay hidden whatever the server allows (see registry.ts pull).
+ * A site that does not load counts as one; call() then says why it does not, in its own fields.
+ */
+const agentPulled = (site: string) => {
+  try {
+    return loadSite(site)?.site.shared?.by === "agent";
+  } catch {
+    return true;
+  }
+};
+const isWrite = (site: string, op: string) => {
+  try {
+    return !!loadSite(site)?.site.operations.some((o) => o.name === op && !o.readOnly);
+  } catch {
+    return false;
+  }
+};
+const pulledWrite = (site: string, op: string) =>
+  reply(
+    {
+      ok: false,
+      class: "input",
+      write: "not_sent",
+      retry: "after_fix",
+      reason: `${op} is a write of a site this server pulled for an agent, and those run only once a human pulls the site`,
+      next: `ask the user to look at the site's operations and, if they trust them, run in a terminal: api-anything pull ${site.toLowerCase()}`,
+    },
+    true,
+  );
 
 /**
  * Said once per session, in the server instructions and in call_operation's description (some
@@ -264,6 +299,7 @@ export function createServer({
     return "result" in r ? r.result : pending(r.job);
   };
 
+  const indexCache: IndexCache = {};
   // without naming the sites up front, an agent asked "what does Goodreads rate X?" reaches for web search
   const server = new McpServer(
     { name: "api-anything", version: VERSION },
@@ -271,6 +307,7 @@ export function createServer({
       instructions:
         `Calls these websites' own data requests directly, usually over plain HTTP: ${listSites().join(", ")}. ` +
         "When the user wants data from one of them, prefer list_operations then call_operation over web search or a browser. " +
+        "For any other website, find_sites first: someone may have shared it, and list_operations then fetches it. " +
         UNTRUSTED_NOTE,
     },
   );
@@ -287,7 +324,10 @@ export function createServer({
     as: ToolCall,
     write?: { again?: boolean; idempotencyKey?: string },
   ): Promise<Reply> => {
-    const r = await callOp(site, op, args, { allowWrites: !!write && allowWrites, ...write });
+    const pulled = agentPulled(site);
+    const r = await callOp(site, op, args, { allowWrites: !!write && allowWrites && !pulled, ...write });
+    // call_write_operation would refuse it too: the step is a human's pull
+    if (r.class === "refused" && allowWrites && pulled) return pulledWrite(site, op);
     const toWriteTool = r.class === "refused" && !write && allowWrites;
     const next = toWriteTool
       ? `${op} is a write: only if the user asked for this exact action, call call_write_operation with the same arguments`
@@ -334,7 +374,8 @@ export function createServer({
         listSites().map((name) => {
           try {
             const s = loadSite(name)!.site;
-            const ops = s.operations.filter((o) => allowWrites || o.readOnly).length;
+            const writes = allowWrites && !agentPulled(name);
+            const ops = s.operations.filter((o) => writes || o.readOnly).length;
             return { name, ...(s.description ? { description: s.description } : {}), operations: ops };
           } catch (e) {
             return { name, error: (e as Error).message };
@@ -344,29 +385,69 @@ export function createServer({
   );
 
   server.registerTool(
+    "find_sites",
+    {
+      description:
+        'Find websites someone already turned into operations: the shared registry and this machine\'s sites, best match first. query is words (what you need: "book ratings", "flight prices"), a domain or a URL. A match with installed false is fetched by list_operations on first use.',
+      inputSchema: { query: z.string().describe("words, a domain or a URL") },
+      annotations: READ_HINTS,
+    },
+    ({ query }: { query: string }) =>
+      guard(async () => {
+        const r = await search(query, { cache: indexCache });
+        const top = r.matches[0];
+        return reply({
+          matches: r.matches.map((m) => ({
+            ...m,
+            operations: m.operations.filter((o) => !o.write).map((o) => o.op),
+          })),
+          ...(r.registryError ? { registryError: r.registryError } : {}),
+          // bundled and pulled specs are someone else's too, installed or not
+          ...(r.matches.length ? { shared: SHARED_NOTE } : {}),
+          next: top
+            ? `list_operations {"site":"${top.site}"}`
+            : "nobody shared one yet: a new site is learned with the CLI (api-anything capture, then add), in your shell or by the user",
+        });
+      }),
+  );
+
+  server.registerTool(
     "list_operations",
     {
       description:
-        "List a site's operations, each with a JSON Schema of its args (inputSchema) and the keys a result item can carry (returns; one the site leaves out is absent), and the site's notes (caveats, arg formats). Call this before call_operation.",
-      inputSchema: { site: z.string().describe("site name from list_sites") },
+        "List a site's operations, each with a JSON Schema of its args (inputSchema) and the keys a result item can carry (returns; one the site leaves out is absent), and the site's notes (caveats, arg formats). Call this before call_operation. A shared site from find_sites that is not installed is pulled from the registry first (reads only).",
+      inputSchema: { site: z.string().describe("site name from list_sites or find_sites") },
       annotations: LOCAL_HINTS,
     },
     ({ site }: { site: string }) =>
       guard(async () => {
-        const r = loadSite(site);
-        if (!r)
-          return reply(
-            {
-              error: `no site "${site}"`,
-              next: `list_sites; if it is not there, the shell command api-anything pull ${site.toLowerCase()} fetches it if someone shared it`,
-            },
-            true,
-          );
+        let pulled: Pulled | undefined;
+        if (!loadSite(site)) {
+          try {
+            pulled = await pull(site, { by: "agent" });
+          } catch (e) {
+            const missing = /^no shared spec/.test((e as Error).message);
+            return reply(
+              {
+                error: missing ? `no site "${site}", here or in the registry` : (e as Error).message,
+                next: missing
+                  ? `find_sites {"query":"${site}"} with words or the site's domain; if nothing matches, a new site is learned with the CLI (api-anything capture, then add)`
+                  : "do not try to get around this; tell the user the shared spec could not be used",
+              },
+              true,
+            );
+          }
+        }
+        const r = loadSite(site)!;
+        const writes = allowWrites && !agentPulled(r.site.name);
         const notes = siteNotes(r.site.name);
         return reply({
           site,
+          ...(pulled
+            ? { pulled: { from: pulled.from, warnings: pulled.warnings.filter((w) => !/a write \(/.test(w)) } }
+            : {}),
           operations: r.site.operations
-            .filter((o) => allowWrites || o.readOnly)
+            .filter((o) => writes || o.readOnly)
             .map((o) => ({
               name: o.name,
               ...(o.description ? { description: o.description } : {}),
@@ -443,6 +524,8 @@ export function createServer({
         guard(async () => {
           const read = readHere(site, op, args);
           if (read) return read;
+          // an agent-pulled site is read-only here, whatever the server allows
+          if (agentPulled(site) && isWrite(site, op)) return pulledWrite(site, op);
           // `again` is left out of the key: a write still on its way is joined, never sent beside itself
           return asJob(`write ${JSON.stringify([site, op, args, idempotencyKey ?? null])}`, WRITE_NOTE, () =>
             callReply(
@@ -460,7 +543,7 @@ export function createServer({
     const s = loadSite(name)?.site;
     if (!s) throw new Error(`no site "${name}"`);
     for (const o of s.operations) {
-      if (!o.readOnly && !allowWrites) continue;
+      if (!o.readOnly && (!allowWrites || agentPulled(s.name))) continue;
       const tool = toolName(s.name, o);
       const returns = returnedFields(o.response);
       const description = [

@@ -974,6 +974,38 @@ does not block. Check args are literals the publisher typed, shared with the spe
 scan lists every check's args for the publisher to confirm, and an `enum` value holding a run of 5+
 digits (an account's id rather than one of the site's options).
 
+**Search.** `api-anything search <words | domain | url>` and MCP `find_sites` read the registry's
+index: `index.json`, which CI builds from `sites/` on every push to main (`scripts/pages.ts`, the
+Pages workflow) and serves on GitHub Pages, so contributors never edit a shared file and two pull
+requests never conflict over it. With `API_ANYTHING_REGISTRY` set, the index is `index.json` beside
+that registry's `sites/`. Each entry: the site, its title and description, the registrable domains its
+ops send to or open, the spec's SHA-256, and each op as pull summarizes it with its description. The
+index is fetched like a spec (no redirect, a size cap, a timeout), kept for 10 minutes by a running
+process, and held to the shared rules' limits, since it reaches the agent as text: a site name as
+`safeName` allows, an op signature whose name the rules allow, texts of at most 500 characters, at
+most 50 ops. An entry that breaks them is dropped, not the whole index. Search output always says
+the texts are someone else's. Local specs
+(the user's, pulled and bundled) are merged in as `installed`, so a site learned here and never shared
+is found too, and an index that cannot be fetched leaves those with a `registryError`. A domain or URL
+query matches the entries whose domains hold its registrable domain; words (lower-cased, under
+3 letters and common words such as "the", "in" or "best" left out, a plural `s` dropped but not from
+"news") are scored against the site's name (most), its title and domains, then its description and
+ops (op names and fields split at camelCase; part of a longer word there counts from 5 letters), a
+word that matches nothing counting against the site; a site under a third of
+the best score matched a stray word and is left out. No ranking by use or health yet.
+
+**Agents pull.** MCP `list_operations` on a site that is not installed pulls it from the registry,
+so an agent with no shell reaches every shared site, and the user never has to know a site's name.
+Pulled this way, the spec's record says `by: "agent"`, and the server neither lists nor runs its
+writes, whatever `--allow-writes` says: page text may have steered the agent to it, so a write waits
+for an `api-anything pull` from the CLI, which rewrites the record without `by`, in the user's own copy
+too when one shadows the pulled spec (a heal's, or one an `add` extended). The mark binds this server
+only: an agent with a shell can run the CLI itself, as it always could. Its reads run with
+what the user already set up and nothing more: a session exists only if a human logged in to that
+site with the CLI or a login window, and session values stay bound to their hosts. This is the same
+trust as a human's pull, since the registry's specs are reviewed (see Trust model), and the same rules
+run on it on every load.
+
 **Recorded answers (`test/fixture/sites/<site>.json`).** CI cannot reach the sites, so for every
 bundled op it can, it keeps an answer trimmed to what the recipe reads: `{op, args, status,
 contentType, note, body}`, the body as text or as JSON. One test in `test/sites.test.ts` checks
@@ -993,13 +1025,11 @@ too, or the classifier calls it drift). Where a site test already built a body f
 (YouTube's ad layout, Google Flights' results), that body is the fixture.
 
 **Nudges, not automation.** Once `verify <site>` passes for a site the user learned, its output
-says it can be shared (`next: api-anything publish <site>`). The skill tells the agent to try `pull`
+says it can be shared (`next: api-anything publish <site>`). The skill tells the agent to `search`
 before `capture`.
 
-Not in this version: search across the registry (an index file CI keeps in sync), signed or
-commit-pinned pulls, health reports from users' calls, runtime checks of resolved addresses, a
-bounded regex engine, and MCP `pull`/`publish` (MCP cannot create operations; pulling one is
-creating one).
+Not in this version: signed or commit-pinned pulls, health reports from users' calls, runtime
+checks of resolved addresses, a bounded regex engine, and MCP `publish`.
 
 ## Logging in (`login.ts`, `import.ts`)
 
@@ -1163,10 +1193,11 @@ independent alternative.
     the same step for a
     program. `test/execute.test.ts` checks the fields over every class, a read and a write, and
     what was sent.
-- **MCP server** (`api-anything mcp`) with fixed meta-tools: `list_sites`, `list_operations`,
-  `call_operation`, `get_job` and `login` (so an agent can fix an `auth` failure itself), plus
+- **MCP server** (`api-anything mcp`) with fixed meta-tools: `list_sites`, `find_sites`,
+  `list_operations`, `call_operation`, `get_job` and `login` (so an agent can fix an `auth` failure itself), plus
   `call_write_operation` on a server started with `--allow-writes`, so the tool list costs the same
-  at 2 sites or 200. The agent may be steered by page content, so MCP `login` import
+  at 2 sites or 200. `find_sites` is `search` (see Sharing specs); `list_operations` on a site that
+  is not installed pulls it from the registry first (see "Agents pull"). The agent may be steered by page content, so MCP `login` import
   only refreshes a site that has a spec and a browser source a human chose with the CLI, from that
   same profile; anything else answers `next`: ask the user to run `api-anything login <site>`. Mode
   window is allowed (a human signs in). MCP cannot create operations: capture and add are CLI only.
@@ -1180,7 +1211,7 @@ independent alternative.
     name `call_write_operation` with the same arguments. `call_write_operation` is destructive and
     not idempotent, takes `again` and `idempotencyKey`, and refuses a read (`input`, pointing back
     at `call_operation`), so a read never meets the write prompt. `list_sites`, `list_operations`
-    and `get_job` are read-only, idempotent and closed-world; `login` changes the local session,
+    and `get_job` are read-only, idempotent and closed-world (`find_sites` is read-only and open-world); `login` changes the local session,
     never the site (not read-only, not destructive, idempotent: a repeat joins the first). Every
     tool sets all four hints, since the spec's defaults for an unset one are the pessimistic ones.
     The split costs a second tool name; the package was not published with the single tool.
