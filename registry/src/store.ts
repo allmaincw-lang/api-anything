@@ -496,3 +496,50 @@ export async function demandList(
 
 export const forgetDemand = (db: D1Database, before: string) =>
   db.prepare("DELETE FROM demand WHERE at < ?").bind(before).run();
+
+/* -------------------------------------------------------------- interfaces */
+
+export async function reportInterface(
+  db: D1Database,
+  i: { url: string; domain: string; kind: string; key: string; network: string },
+  now: string,
+): Promise<void> {
+  await db.batch([
+    db
+      .prepare("INSERT OR IGNORE INTO interfaces (url, domain, kind, created_at) VALUES (?, ?, ?, ?)")
+      .bind(i.url, i.domain, i.kind, now),
+    db
+      .prepare(
+        "INSERT INTO interface_reports (url, key, network, at) VALUES (?, ?, ?, ?) ON CONFLICT (url, key) DO UPDATE SET network = excluded.network, at = excluded.at",
+      )
+      .bind(i.url, i.key, i.network, now),
+  ]);
+}
+
+/** The interfaces of `domains` that at least `k` installs, one per network, reported. */
+export async function interfacesOf(
+  db: D1Database,
+  domains: string[],
+  k: number,
+): Promise<Map<string, { kind: "mcp" | "openapi"; url: string; confirmations: number }[]>> {
+  const out = new Map<string, { kind: "mcp" | "openapi"; url: string; confirmations: number }[]>();
+  if (!domains.length) return out;
+  const { results } = await db
+    .prepare(
+      `SELECT i.url, i.domain, i.kind, r.key, r.network FROM interfaces i JOIN interface_reports r ON r.url = i.url
+       WHERE i.domain IN (${domains.map(() => "?").join(",")})`,
+    )
+    .bind(...domains)
+    .all<{ url: string; domain: string; kind: "mcp" | "openapi"; key: string; network: string }>();
+  const byUrl = new Map<string, typeof results>();
+  for (const r of results) byUrl.set(r.url, [...(byUrl.get(r.url) ?? []), r]);
+  for (const [url, rows] of byUrl) {
+    const n = holders(rows);
+    if (n < k) continue;
+    const { domain, kind } = rows[0]!;
+    out.set(domain, [...(out.get(domain) ?? []), { kind, url, confirmations: n }]);
+  }
+  // the best confirmed ten a domain has: what the client keeps
+  for (const [d, list] of out) out.set(d, list.sort((a, b) => b.confirmations - a.confirmations).slice(0, 10));
+  return out;
+}

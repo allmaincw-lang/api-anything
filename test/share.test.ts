@@ -945,3 +945,48 @@ test("a claim is answered under the name the site went up under, and with its ow
     fake.matches = [];
   }
 });
+
+/* ------------------------------------------------- sites' own interfaces */
+
+test("search passes on a site's own interfaces, and drops a malformed one without dropping the match", async () => {
+  const { search } = await import("../src/registry.js");
+  fake.matches = [
+    {
+      name: "weather-example-org",
+      domain: "weather-example.org",
+      operations: [],
+      interfaces: [
+        { kind: "openapi", url: "https://api.weather-example.org/openapi.json", confirmations: 2 },
+        { kind: "mcp", url: "http://10.0.0.2/mcp", confirmations: 9 },
+      ],
+    },
+  ];
+  try {
+    const r = await search("weather-example.org", { local: [] });
+    assert.deepEqual(r.matches[0]?.interfaces, [
+      { kind: "openapi", url: "https://api.weather-example.org/openapi.json", confirmations: 2 },
+    ]);
+  } finally {
+    fake.matches = [];
+  }
+});
+
+test("an installed site shows the interfaces the registry knows for its domain, and an eleventh interface drops no match", async () => {
+  const { search } = await import("../src/registry.js");
+  const many = Array.from({ length: 12 }, (_, i) => ({
+    kind: "mcp" as const,
+    url: `https://mcp${i}.example.com/sse`,
+    confirmations: 2,
+  }));
+  fake.matches = [{ name: "example-com", domain: "example.com", operations: [], interfaces: many }];
+  try {
+    const r = await search("example.com", { local: [site()] });
+    const here = r.matches.find((m) => m.site === "demo");
+    assert.ok(here, "the installed site is still the match");
+    assert.equal(here!.installed, true);
+    assert.equal(here!.operations[0]!.name, "search", "its own operations stay");
+    assert.equal(here!.interfaces?.length, 10, "at most ten, the rest dropped, not the match");
+  } finally {
+    fake.matches = [];
+  }
+});
