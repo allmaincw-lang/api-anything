@@ -3,9 +3,9 @@ import type { FoundOp, SearchMatch, ServedOp, ServedSite } from "../../src/regis
 import { domainOf, type IndexEntry, indexEntry, score, summarize } from "../../src/search.js";
 import type { Operation, Site } from "../../src/spec.js";
 import { byRank, successRate } from "./rules.js";
-import { allSites, context, type D1Database, getSite, type StatRow, servable } from "./store.js";
+import { allSites, context, type D1Database, getSite, servable, type VersionRow } from "./store.js";
 
-const servedOp = (r: StatRow): ServedOp => {
+const servedOp = (r: VersionRow): ServedOp => {
   const rate = successRate(r.oks, r.bad);
   return {
     hash: r.hash,
@@ -22,7 +22,7 @@ const servedOp = (r: StatRow): ServedOp => {
  * has it: real specs hold distinct ops on one endpoint (goodreads getBook and getWorkId, google-flights
  * search and top), and a site must never serve two ops of one name.
  */
-export function bestPerOp(rows: StatRow[]): ServedOp[] {
+export function bestPerOp(rows: VersionRow[]): ServedOp[] {
   const groups = new Map<string, ServedOp & { createdAt: string; liveSince?: string }>();
   for (const r of rows) {
     const op = { ...servedOp(r), createdAt: r.created_at, ...(r.live_since ? { liveSince: r.live_since } : {}) };
@@ -35,9 +35,9 @@ export function bestPerOp(rows: StatRow[]): ServedOp[] {
 }
 
 /** The sites with something to serve this viewer, by name; `name` narrows to one. */
-export async function catalog(db: D1Database, since: string, viewer?: string, name?: string): Promise<ServedSite[]> {
-  const rows = await servable(db, since, viewer, name);
-  const bySite = new Map<string, StatRow[]>();
+export async function catalog(db: D1Database, viewer?: string, name?: string): Promise<ServedSite[]> {
+  const rows = await servable(db, viewer, name);
+  const bySite = new Map<string, VersionRow[]>();
   for (const r of rows) bySite.set(r.site, [...(bySite.get(r.site) ?? []), r]);
   const sites = name ? [await getSite(db, name)].flatMap((s) => (s ? [s] : [])) : await allSites(db);
   return sites.flatMap((s) => {

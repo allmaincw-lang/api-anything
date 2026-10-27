@@ -27,6 +27,9 @@ export interface Thresholds {
   newKeyUploads: number;
   /** uploads an hour across every key: the circuit breaker */
   uploadsPerHourAll: number;
+  /** a version this many installs reported is recounted at most every `statsSeconds`; fewer, on every report */
+  statsLiveUpTo: number;
+  statsSeconds: number;
 }
 
 /** Each threshold from the env var of its name (a Worker var is a string), else its default. */
@@ -49,6 +52,8 @@ export function thresholds(env: object): Thresholds {
     newKeyUploads: n("NEW_KEY_UPLOADS", 5),
     uploadsPerHourAll: n("UPLOADS_PER_HOUR_ALL", 300),
     claimKeys: n("CLAIM_KEYS", 3),
+    statsLiveUpTo: n("STATS_LIVE_UP_TO", 100),
+    statsSeconds: n("STATS_SECONDS", 60),
   };
 }
 

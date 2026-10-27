@@ -41,6 +41,8 @@ import {
   interfacesOf,
   putClaim,
   putReport,
+  putStats,
+  recountAll,
   reportInterface,
   reseed,
   seedSite,
@@ -200,11 +202,20 @@ async function newKeyLimit(c: Ctx, key: string) {
     throw tooMany(`a key new this hour uploads at most ${c.t.newKeyUploads} versions`, seen + HOUR, c.now);
 }
 
-/** Applies what the version's reports now say to its status. */
+/**
+ * Applies what the version's reports now say to its status, and keeps their counts beside it. Counting
+ * reads every report of the version, so one that many installs report is recounted at most every
+ * `statsSeconds`: otherwise each report would cost as many reads as the version has installs.
+ */
 async function recompute(c: Ctx, v: VersionRow): Promise<Status> {
+  const counted = v.stats_at ? Date.parse(v.stats_at) : 0;
+  if (v.reporters >= c.t.statsLiveUpTo && c.now - counted < c.t.statsSeconds * 1000) return v.status;
   const weekAgo = new Date(c.now - 7 * DAY).toISOString();
-  const status = nextStatus(v.status, await facts(c.env.DB, v, c.since, c.t.degradeWindow, weekAgo), c.t);
-  if (status !== v.status) await setStatus(c.env.DB, v.hash, status, new Date(c.now).toISOString());
+  const now = new Date(c.now).toISOString();
+  const f = await facts(c.env.DB, v, c.since, c.t.degradeWindow, weekAgo);
+  await putStats(c.env.DB, v.hash, f.stats, now);
+  const status = nextStatus(v.status, f, c.t);
+  if (status !== v.status) await setStatus(c.env.DB, v.hash, status, now);
   return status;
 }
 
@@ -214,7 +225,7 @@ async function searchApi(c: Ctx) {
   const q = c.url.searchParams.get("q")?.trim();
   if (!q) throw new HttpError(400, "search takes q: words, a domain or a URL");
   const limit = Math.min(Math.max(Number(c.url.searchParams.get("limit")) || 5, 1), 20);
-  const sites = await catalog(c.env.DB, c.since, await keyOf(c, false));
+  const sites = await catalog(c.env.DB, await keyOf(c, false));
   const matches = await withInterfaces(c, search(sites, q, limit));
   const asked = domainOf(q);
   // a site with only its own agent interface is found by its domain
@@ -248,7 +259,7 @@ async function demandApi(c: Ctx) {
 }
 
 async function siteApi(c: Ctx, name: string) {
-  const [site] = await catalog(c.env.DB, c.since, await keyOf(c, false), name);
+  const [site] = await catalog(c.env.DB, await keyOf(c, false), name);
   if (!site) throw new HttpError(404, `no shared site ${name}`);
   const own = (await interfacesOf(c.env.DB, [site.domain], interfaceKeys(c))).get(site.domain);
   return json(own ? { ...site, interfaces: own } : site);
@@ -283,7 +294,7 @@ async function addInterface(c: Ctx) {
 }
 
 async function indexApi(c: Ctx) {
-  const sites = await catalog(c.env.DB, c.since, await keyOf(c, false));
+  const sites = await catalog(c.env.DB, await keyOf(c, false));
   return json({ generated: new Date(c.now).toISOString(), sites: sites.filter(confirmed).map(entryOf) });
 }
 
@@ -556,7 +567,7 @@ async function adminSeed(c: Ctx) {
 /* ------------------------------------------------------------------ pages */
 
 async function home(c: Ctx) {
-  const sites = await catalog(c.env.DB, c.since);
+  const sites = await catalog(c.env.DB);
   const q = c.url.searchParams.get("q")?.trim();
   // a site nobody but its uploader vouched for may say it is any brand: it is reached by name or domain only
   if (!q)
@@ -574,13 +585,13 @@ async function home(c: Ctx) {
 }
 
 async function landing(c: Ctx, name: string) {
-  const [site] = await catalog(c.env.DB, c.since, undefined, name);
+  const [site] = await catalog(c.env.DB, undefined, name);
   if (!site) return html(homePage([], c.url.origin, name), 404);
   return html(sitePage(site, c.url.origin));
 }
 
 async function sitemapXml(c: Ctx) {
-  const sites = await catalog(c.env.DB, c.since);
+  const sites = await catalog(c.env.DB);
   return new Response(
     sitemap(
       sites.filter(confirmed).map((s) => s.name),
@@ -696,6 +707,7 @@ export default {
       new Date(now - 30 * DAY).toISOString(),
     );
     await forgetDemand(env.DB, new Date(now - 90 * DAY).toISOString());
+    await recountAll(env.DB, cutoff, new Date(now).toISOString());
     console.log(`archived ${gone.length} versions`);
   },
 };

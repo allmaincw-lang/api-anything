@@ -429,6 +429,32 @@ describe("maintenance by the crowd", () => {
     assert.equal((await served()).hash, live.hash);
   });
 
+  test("counts are kept beside each version: a version many installs report is recounted once a minute, and daily", async () => {
+    const { env, raw } = registry({ STATS_LIVE_UP_TO: "2" });
+    const live = (await seed(env, { site, operations: [op()] })).body.operations[0];
+    const confirmations = async () =>
+      (await send(env, "GET", "/v1/sites/example-com")).body.operations[0].confirmations;
+
+    await report(env, install(), live.hash, "ok", NET1);
+    await report(env, install(), live.hash, "ok", NET2);
+    assert.equal(await confirmations(), 2, "under STATS_LIVE_UP_TO installs, every report recounts");
+    await report(env, install(), live.hash, "ok", "203.0.113.9");
+    assert.equal(await confirmations(), 2, "counted under a minute ago");
+    const stored = raw.prepare("SELECT COUNT(*) AS n FROM reports WHERE hash = ?").get(live.hash) as { n: number };
+    assert.equal(stored.n, 3, "the report itself is kept");
+
+    raw
+      .prepare("UPDATE versions SET stats_at = ? WHERE hash = ?")
+      .run(new Date(Date.now() - 2 * 60_000).toISOString(), live.hash);
+    await report(env, install(), live.hash, "ok", "100.64.1.1");
+    assert.equal(await confirmations(), 4, "a minute on, the next report recounts");
+
+    await report(env, install(), live.hash, "ok", "100.64.2.1");
+    assert.equal(await confirmations(), 4);
+    await worker.scheduled({ scheduledTime: Date.now() }, env);
+    assert.equal(await confirmations(), 5, "the daily job recounts every version");
+  });
+
   test("a review version is served only to its uploader", async () => {
     const { env } = registry();
     const uploader = install();
