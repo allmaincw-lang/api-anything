@@ -103,7 +103,7 @@ codex mcp add api-anything -- api-anything mcp                 # Codex
 api-anything mcp --print-config                                # any other client
 ```
 
-To try one read with no install: `npx -y github:goodnight000/api-anything call hacker-news search query=sqlite`.
+To try one read with no install: `npx -y api-anything call hacker-news search query=sqlite`.
 
 A Chromium browser is needed only to teach new sites and for the browser tiers: Google Chrome by
 default, or Brave, Edge, Chromium, Vivaldi or Arc. `API_ANYTHING_BROWSER` names any other.
@@ -251,8 +251,7 @@ await call("my-site", "postComment", { text: "Ship it" }, { allowWrites: true })
 ```
 
 [`examples/reading-list.mjs`](examples/reading-list.mjs) builds a five-book table from Goodreads with
-no model and no browser. In another project, install the packed tarball from your clone
-(`npm install /path/to/api-anything-0.1.0.tgz`).
+no model and no browser. In another project, `npm install api-anything`.
 
 </details>
 
