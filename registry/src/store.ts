@@ -41,13 +41,25 @@ export interface VersionRow {
   live_since: string | null;
   /** the uploader's network hash, as reports store it */
   uploader_network: string | null;
-}
-
-/** A version with what its recent reports say. */
-export interface StatRow extends VersionRow {
+  /** what its recent reports said when last counted (`Stats`), so serving reads no reports */
   confirmations: number;
   oks: number;
   bad: number;
+  reporters: number;
+  stats_at: string | null;
+  /** 1 while a report waits for a recount that was held back */
+  pending: number;
+}
+
+/** A version's recent reports, counted: each install once, by its latest outcome. */
+export interface Stats {
+  /** installs other than the uploader whose outcome is ok */
+  confirmations: number;
+  oks: number;
+  /** fail or wrong */
+  bad: number;
+  /** every install that reported it */
+  reporters: number;
 }
 
 export const context = (r: SiteRow): SiteContext => ({
@@ -162,6 +174,35 @@ export const setStatus = (db: D1Database, hash: string, status: Status, now: str
     .bind(status, now, status, now, hash)
     .run();
 
+export const putStats = (db: D1Database, hash: string, s: Stats, at: string) =>
+  db
+    .prepare("UPDATE versions SET confirmations = ?, oks = ?, bad = ?, reporters = ?, stats_at = ? WHERE hash = ?")
+    .bind(s.confirmations, s.oks, s.bad, s.reporters, at, hash)
+    .run();
+
+export const markPending = (db: D1Database, hash: string, pending: boolean) =>
+  db
+    .prepare("UPDATE versions SET pending = ? WHERE hash = ?")
+    .bind(pending ? 1 : 0, hash)
+    .run();
+
+export const pendingVersions = async (db: D1Database) =>
+  (await db.prepare("SELECT * FROM versions WHERE pending = 1").all<VersionRow>()).results;
+
+/** Recounts every version from its reports since `since`: the daily job, as reports age out. */
+export const recountAll = (db: D1Database, since: string, at: string) =>
+  db
+    .prepare(
+      `UPDATE versions SET
+        confirmations = (SELECT COUNT(*) FROM reports r WHERE r.hash = versions.hash AND r.at >= ? AND r.outcome = 'ok' AND r.key <> versions.uploader),
+        oks = (SELECT COUNT(*) FROM reports r WHERE r.hash = versions.hash AND r.at >= ? AND r.outcome = 'ok'),
+        bad = (SELECT COUNT(*) FROM reports r WHERE r.hash = versions.hash AND r.at >= ? AND r.outcome IN ('fail', 'wrong')),
+        reporters = (SELECT COUNT(*) FROM reports r WHERE r.hash = versions.hash AND r.at >= ?),
+        stats_at = ?`,
+    )
+    .bind(since, since, since, since, at)
+    .run();
+
 /** A seed's version is live from now; a blocked one stays blocked. */
 export const reseed = (db: D1Database, hash: string, now: string) =>
   db
@@ -219,17 +260,28 @@ export async function facts(
   since: string,
   window: number,
   weekAgo: string,
-): Promise<Facts> {
+): Promise<Facts & { stats: Stats }> {
   const counts = await db
     .prepare(
       `SELECT COALESCE(SUM(outcome = 'ok' AND key <> ?), 0) AS okKeys,
         COUNT(DISTINCT CASE WHEN outcome = 'ok' AND key <> ? THEN network END) AS okNetworks,
         COALESCE(SUM(outcome = 'wrong'), 0) AS wrongKeys,
-        COUNT(DISTINCT CASE WHEN outcome = 'ok' AND at >= ? THEN network END) AS weekOkNetworks
+        COUNT(DISTINCT CASE WHEN outcome = 'ok' AND at >= ? THEN network END) AS weekOkNetworks,
+        COALESCE(SUM(outcome = 'ok'), 0) AS oks,
+        COALESCE(SUM(outcome IN ('fail', 'wrong')), 0) AS bad,
+        COUNT(*) AS reporters
       FROM reports WHERE hash = ? AND at >= ?`,
     )
     .bind(v.uploader, v.uploader, weekAgo, v.hash, since)
-    .first<{ okKeys: number; okNetworks: number; wrongKeys: number; weekOkNetworks: number }>();
+    .first<{
+      okKeys: number;
+      okNetworks: number;
+      wrongKeys: number;
+      weekOkNetworks: number;
+      oks: number;
+      bad: number;
+      reporters: number;
+    }>();
   const latest = await db
     .prepare(
       `SELECT outcome, network FROM reports WHERE hash = ? AND at >= ? AND outcome IN (${ABOUT_OP.map(() => "?").join(", ")}) ORDER BY at DESC LIMIT ?`,
@@ -245,28 +297,29 @@ export async function facts(
     latest: latest.results.map((r) => r.outcome),
     failedNetworks: new Set(failed.map((r) => r.network)).size,
     weekOkNetworks: counts?.weekOkNetworks ?? 0,
+    stats: {
+      confirmations: counts?.okKeys ?? 0,
+      oks: counts?.oks ?? 0,
+      bad: counts?.bad ?? 0,
+      reporters: counts?.reporters ?? 0,
+    },
   };
 }
 
 /**
- * The versions a viewer may be served, with their recent report counts: everything served, and the
- * viewer's own `review` versions. `site` narrows to one site.
+ * The versions a viewer may be served, with their counts as last recounted: everything served, and the
+ * viewer's own `review` versions. `site` narrows to one site. It reads no reports, whatever their number.
  */
-export async function servable(db: D1Database, since: string, viewer?: string, site?: string): Promise<StatRow[]> {
+export async function servable(db: D1Database, viewer?: string, site?: string): Promise<VersionRow[]> {
   const statuses = SERVED.map(() => "?").join(", ");
   return (
     await db
       .prepare(
-        `SELECT v.*,
-          COALESCE(SUM(r.outcome = 'ok' AND r.key <> v.uploader), 0) AS confirmations,
-          COALESCE(SUM(r.outcome = 'ok'), 0) AS oks,
-          COALESCE(SUM(r.outcome IN ('fail', 'wrong')), 0) AS bad
-        FROM versions v LEFT JOIN reports r ON r.hash = v.hash AND r.at >= ?
-        WHERE (v.status IN (${statuses}) OR (v.status = 'review' AND v.uploader = ?))${site ? " AND v.site = ?" : ""}
-        GROUP BY v.hash`,
+        `SELECT * FROM versions
+        WHERE (status IN (${statuses}) OR (status = 'review' AND uploader = ?))${site ? " AND site = ?" : ""}`,
       )
-      .bind(since, ...SERVED, viewer ?? "", ...(site ? [site] : []))
-      .all<StatRow>()
+      .bind(...SERVED, viewer ?? "", ...(site ? [site] : []))
+      .all<VersionRow>()
   ).results;
 }
 

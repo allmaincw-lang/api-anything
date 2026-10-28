@@ -39,8 +39,12 @@ import {
   holders,
   incumbentSig,
   interfacesOf,
+  markPending,
+  pendingVersions,
   putClaim,
   putReport,
+  putStats,
+  recountAll,
   reportInterface,
   reseed,
   seedSite,
@@ -76,6 +80,8 @@ export interface Env {
 }
 
 const DAY = 86_400_000;
+/** registry/wrangler.jsonc's cron for the pending recounts; the other cron is the daily job */
+const EVERY_MINUTE = "* * * * *";
 const HOUR = 3_600_000;
 const MAX_BODY = 256 * 1024;
 const MAX_SEED = 1024 * 1024;
@@ -116,8 +122,6 @@ interface Ctx {
   url: URL;
   now: number;
   t: Thresholds;
-  /** the start of the recent window, ISO */
-  since: string;
   body: Uint8Array<ArrayBuffer>;
 }
 
@@ -200,11 +204,30 @@ async function newKeyLimit(c: Ctx, key: string) {
     throw tooMany(`a key new this hour uploads at most ${c.t.newKeyUploads} versions`, seen + HOUR, c.now);
 }
 
-/** Applies what the version's reports now say to its status. */
-async function recompute(c: Ctx, v: VersionRow): Promise<Status> {
-  const weekAgo = new Date(c.now - 7 * DAY).toISOString();
-  const status = nextStatus(v.status, await facts(c.env.DB, v, c.since, c.t.degradeWindow, weekAgo), c.t);
-  if (status !== v.status) await setStatus(c.env.DB, v.hash, status, new Date(c.now).toISOString());
+const recompute = (c: Ctx, v: VersionRow) => judge(c.env.DB, c.t, c.now, v);
+
+/**
+ * Applies what the version's reports now say to its status, and keeps their counts beside it. Counting
+ * reads every report of the version, so one that many installs report is recounted at most every
+ * `statsSeconds`, otherwise each report would cost as many reads as the version has installs. A report
+ * in between marks it pending, and the job every minute recounts it (`force`), so no status change
+ * waits on another report coming.
+ */
+async function judge(db: D1Database, t: Thresholds, at: number, v: VersionRow, force = false): Promise<Status> {
+  const counted = v.stats_at ? Date.parse(v.stats_at) : 0;
+  if (!force && v.reporters >= t.statsLiveUpTo && at - counted < t.statsSeconds * 1000) {
+    if (!v.pending) await markPending(db, v.hash, true);
+    return v.status;
+  }
+  // cleared before counting: a report held back while this counts marks it again
+  if (v.pending) await markPending(db, v.hash, false);
+  const since = new Date(at - t.recentDays * DAY).toISOString();
+  const weekAgo = new Date(at - 7 * DAY).toISOString();
+  const now = new Date(at).toISOString();
+  const f = await facts(db, v, since, t.degradeWindow, weekAgo);
+  await putStats(db, v.hash, f.stats, now);
+  const status = nextStatus(v.status, f, t);
+  if (status !== v.status) await setStatus(db, v.hash, status, now);
   return status;
 }
 
@@ -214,7 +237,7 @@ async function searchApi(c: Ctx) {
   const q = c.url.searchParams.get("q")?.trim();
   if (!q) throw new HttpError(400, "search takes q: words, a domain or a URL");
   const limit = Math.min(Math.max(Number(c.url.searchParams.get("limit")) || 5, 1), 20);
-  const sites = await catalog(c.env.DB, c.since, await keyOf(c, false));
+  const sites = await catalog(c.env.DB, await keyOf(c, false));
   const matches = await withInterfaces(c, search(sites, q, limit));
   const asked = domainOf(q);
   // a site with only its own agent interface is found by its domain
@@ -248,7 +271,7 @@ async function demandApi(c: Ctx) {
 }
 
 async function siteApi(c: Ctx, name: string) {
-  const [site] = await catalog(c.env.DB, c.since, await keyOf(c, false), name);
+  const [site] = await catalog(c.env.DB, await keyOf(c, false), name);
   if (!site) throw new HttpError(404, `no shared site ${name}`);
   const own = (await interfacesOf(c.env.DB, [site.domain], interfaceKeys(c))).get(site.domain);
   return json(own ? { ...site, interfaces: own } : site);
@@ -283,7 +306,7 @@ async function addInterface(c: Ctx) {
 }
 
 async function indexApi(c: Ctx) {
-  const sites = await catalog(c.env.DB, c.since, await keyOf(c, false));
+  const sites = await catalog(c.env.DB, await keyOf(c, false));
   return json({ generated: new Date(c.now).toISOString(), sites: sites.filter(confirmed).map(entryOf) });
 }
 
@@ -556,7 +579,7 @@ async function adminSeed(c: Ctx) {
 /* ------------------------------------------------------------------ pages */
 
 async function home(c: Ctx) {
-  const sites = await catalog(c.env.DB, c.since);
+  const sites = await catalog(c.env.DB);
   const q = c.url.searchParams.get("q")?.trim();
   // a site nobody but its uploader vouched for may say it is any brand: it is reached by name or domain only
   if (!q)
@@ -574,13 +597,13 @@ async function home(c: Ctx) {
 }
 
 async function landing(c: Ctx, name: string) {
-  const [site] = await catalog(c.env.DB, c.since, undefined, name);
+  const [site] = await catalog(c.env.DB, undefined, name);
   if (!site) return html(homePage([], c.url.origin, name), 404);
   return html(sitePage(site, c.url.origin));
 }
 
 async function sitemapXml(c: Ctx) {
-  const sites = await catalog(c.env.DB, c.since);
+  const sites = await catalog(c.env.DB);
   return new Response(
     sitemap(
       sites.filter(confirmed).map((s) => s.name),
@@ -632,8 +655,7 @@ async function route(request: Request, env: Env, now: number): Promise<Response>
   if (hit.auth === "admin") await admin(request, env);
   const t = thresholds(env);
   const body = await readBody(request, hit.max ?? MAX_BODY);
-  const since = new Date(now - t.recentDays * DAY).toISOString();
-  return hit.handler({ request, env, url, now, t, since, body }, hit.param);
+  return hit.handler({ request, env, url, now, t, body }, hit.param);
 }
 
 /** The Workers Cache API's default cache, absent outside Workers (tests may stand one in). */
@@ -681,12 +703,18 @@ export default {
   },
 
   /**
-   * The daily job: archive stale candidates and degraded versions, and degraded versions a newer live one
-   * replaced; delete what was archived over 30 days ago, with its reports.
+   * Every minute: recount the versions whose recount a report found held back. Daily: archive stale
+   * candidates and degraded versions, and degraded versions a newer live one replaced; delete what was
+   * archived over 30 days ago, with its reports; recount every version as reports age out.
    */
-  async scheduled(controller: { scheduledTime: number }, env: Env): Promise<void> {
+  async scheduled(controller: { scheduledTime: number; cron?: string }, env: Env): Promise<void> {
     const now = controller.scheduledTime;
-    const cutoff = new Date(now - thresholds(env).recentDays * DAY).toISOString();
+    const t = thresholds(env);
+    if (controller.cron === EVERY_MINUTE) {
+      for (const v of await pendingVersions(env.DB)) await judge(env.DB, t, now, v, true);
+      return;
+    }
+    const cutoff = new Date(now - t.recentDays * DAY).toISOString();
     const gone = toArchive(await archiveCandidates(env.DB), cutoff);
     await archive(
       env.DB,
@@ -696,6 +724,7 @@ export default {
       new Date(now - 30 * DAY).toISOString(),
     );
     await forgetDemand(env.DB, new Date(now - 90 * DAY).toISOString());
+    await recountAll(env.DB, cutoff, new Date(now).toISOString());
     console.log(`archived ${gone.length} versions`);
   },
 };

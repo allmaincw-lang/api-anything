@@ -14,7 +14,8 @@
       "migrations_dir": "migrations"
     }
   ],
-  // archive what nobody called successfully in 30 days; delete what was archived 30 days ago
-  "triggers": { "crons": ["17 3 * * *"] }
+  // daily: archive what nobody called successfully in 30 days, delete what was archived 30 days ago, recount;
+  // every minute: recount the versions a report found held back (worker.ts EVERY_MINUTE)
+  "triggers": { "crons": ["17 3 * * *", "* * * * *"] }
   // secrets: ADMIN_TOKEN, SALT (wrangler secret put). Thresholds (rules.ts) can be set as vars.
 }

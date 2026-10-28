@@ -223,6 +223,14 @@ maintainer sets its status (`POST /v1/admin/versions/:hash`), when it:
   (goodreads `getBook` and `getWorkId` both match `/book/show/*`). The best is served: live over
   candidate over degraded; of two live versions the incumbent; otherwise by success rate, then by
   confirmations.
+- Each version keeps its report counts beside it (installs confirming it, oks, failures, installs that
+  reported it), so a search, a site or the index reads versions only, never reports. A report recounts
+  its version and moves its status, except that a version `STATS_LIVE_UP_TO` (100) or more installs
+  reported is recounted at most every `STATS_SECONDS` (60): a count reads all of its reports, and each
+  report would otherwise cost as many reads as the version has installs. A report in between marks the
+  version pending, and a job every minute recounts and re-judges what is pending, so degrading or
+  promoting such a version waits a minute or two, never on another report coming. The daily job
+  recounts every version, as reports age out of the last 30 days.
 - A daily job archives a candidate or degraded version with no ok report in 30 days, and a degraded
   version older than a live version of the same op, which replaced it. It never archives a live
   version: a newer live one may be a takeover. A live version leaves live only by degrading. The job
@@ -272,7 +280,7 @@ What these rules leave open:
 
 D1 tables: `sites` (name, domain, display fields, notes, first uploader), `versions` (hash, site,
 op name, match signature, operation JSON, parent, status, uploader and its network hash, evidence,
-timestamps including when it first went live), `reports`
+timestamps including when it first went live, its report counts), `reports`
 (hash, key, network hash, outcome, tier, at), `keys` (public key, first seen, counts), `rates` (hourly
 counters, kept for a day), `claims` (fingerprint, site, key, network hash, name hash, at), `demand`
 (registrable domain, network hash, at; deleted after 90 days), `interfaces` and `interface_reports`
