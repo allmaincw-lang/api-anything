@@ -69,8 +69,8 @@ learned for it.
 </tr>
 </table>
 
-**It's live.** [Browse the shared catalog](https://api-anything-registry.forth-site.workers.dev),
-and see the sites agents asked for that nobody has shared yet. [How the catalog works](docs/REGISTRY.md)
+**It's live.** [Browse the shared catalog](https://api-anything-registry.forth-site.workers.dev). Its
+home page also lists the sites agents asked for that nobody has shared yet. [How the catalog works](docs/REGISTRY.md)
 
 ## The race
 
