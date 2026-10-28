@@ -176,14 +176,15 @@ export const setStatus = (db: D1Database, hash: string, status: Status, now: str
 
 export const putStats = (db: D1Database, hash: string, s: Stats, at: string) =>
   db
-    .prepare(
-      "UPDATE versions SET confirmations = ?, oks = ?, bad = ?, reporters = ?, stats_at = ?, pending = 0 WHERE hash = ?",
-    )
+    .prepare("UPDATE versions SET confirmations = ?, oks = ?, bad = ?, reporters = ?, stats_at = ? WHERE hash = ?")
     .bind(s.confirmations, s.oks, s.bad, s.reporters, at, hash)
     .run();
 
-export const markPending = (db: D1Database, hash: string) =>
-  db.prepare("UPDATE versions SET pending = 1 WHERE hash = ? AND pending = 0").bind(hash).run();
+export const markPending = (db: D1Database, hash: string, pending: boolean) =>
+  db
+    .prepare("UPDATE versions SET pending = ? WHERE hash = ?")
+    .bind(pending ? 1 : 0, hash)
+    .run();
 
 export const pendingVersions = async (db: D1Database) =>
   (await db.prepare("SELECT * FROM versions WHERE pending = 1").all<VersionRow>()).results;

@@ -216,9 +216,11 @@ const recompute = (c: Ctx, v: VersionRow) => judge(c.env.DB, c.t, c.now, v);
 async function judge(db: D1Database, t: Thresholds, at: number, v: VersionRow, force = false): Promise<Status> {
   const counted = v.stats_at ? Date.parse(v.stats_at) : 0;
   if (!force && v.reporters >= t.statsLiveUpTo && at - counted < t.statsSeconds * 1000) {
-    await markPending(db, v.hash);
+    if (!v.pending) await markPending(db, v.hash, true);
     return v.status;
   }
+  // cleared before counting: a report held back while this counts marks it again
+  if (v.pending) await markPending(db, v.hash, false);
   const since = new Date(at - t.recentDays * DAY).toISOString();
   const weekAgo = new Date(at - 7 * DAY).toISOString();
   const now = new Date(at).toISOString();
