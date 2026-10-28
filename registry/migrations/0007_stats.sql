@@ -6,6 +6,9 @@ ALTER TABLE versions ADD COLUMN bad INTEGER NOT NULL DEFAULT 0;
 -- installs that reported it: a version past STATS_LIVE_UP_TO is recounted at most every STATS_SECONDS
 ALTER TABLE versions ADD COLUMN reporters INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE versions ADD COLUMN stats_at TEXT;
+-- a report arrived while its recount was held back: the job every minute recounts it
+ALTER TABLE versions ADD COLUMN pending INTEGER NOT NULL DEFAULT 0;
+CREATE INDEX versions_pending ON versions (pending) WHERE pending = 1;
 
 UPDATE versions SET
   confirmations = (SELECT COUNT(*) FROM reports r WHERE r.hash = versions.hash AND r.outcome = 'ok'

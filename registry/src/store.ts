@@ -47,6 +47,8 @@ export interface VersionRow {
   bad: number;
   reporters: number;
   stats_at: string | null;
+  /** 1 while a report waits for a recount that was held back */
+  pending: number;
 }
 
 /** A version's recent reports, counted: each install once, by its latest outcome. */
@@ -174,11 +176,19 @@ export const setStatus = (db: D1Database, hash: string, status: Status, now: str
 
 export const putStats = (db: D1Database, hash: string, s: Stats, at: string) =>
   db
-    .prepare("UPDATE versions SET confirmations = ?, oks = ?, bad = ?, reporters = ?, stats_at = ? WHERE hash = ?")
+    .prepare(
+      "UPDATE versions SET confirmations = ?, oks = ?, bad = ?, reporters = ?, stats_at = ?, pending = 0 WHERE hash = ?",
+    )
     .bind(s.confirmations, s.oks, s.bad, s.reporters, at, hash)
     .run();
 
-/** Recounts every version not archived from its reports since `since`: the daily job, as reports age out. */
+export const markPending = (db: D1Database, hash: string) =>
+  db.prepare("UPDATE versions SET pending = 1 WHERE hash = ? AND pending = 0").bind(hash).run();
+
+export const pendingVersions = async (db: D1Database) =>
+  (await db.prepare("SELECT * FROM versions WHERE pending = 1").all<VersionRow>()).results;
+
+/** Recounts every version from its reports since `since`: the daily job, as reports age out. */
 export const recountAll = (db: D1Database, since: string, at: string) =>
   db
     .prepare(
@@ -187,8 +197,7 @@ export const recountAll = (db: D1Database, since: string, at: string) =>
         oks = (SELECT COUNT(*) FROM reports r WHERE r.hash = versions.hash AND r.at >= ? AND r.outcome = 'ok'),
         bad = (SELECT COUNT(*) FROM reports r WHERE r.hash = versions.hash AND r.at >= ? AND r.outcome IN ('fail', 'wrong')),
         reporters = (SELECT COUNT(*) FROM reports r WHERE r.hash = versions.hash AND r.at >= ?),
-        stats_at = ?
-      WHERE status <> 'archived'`,
+        stats_at = ?`,
     )
     .bind(since, since, since, since, at)
     .run();

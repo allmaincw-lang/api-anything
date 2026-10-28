@@ -39,6 +39,8 @@ import {
   holders,
   incumbentSig,
   interfacesOf,
+  markPending,
+  pendingVersions,
   putClaim,
   putReport,
   putStats,
@@ -78,6 +80,8 @@ export interface Env {
 }
 
 const DAY = 86_400_000;
+/** registry/wrangler.jsonc's cron for the pending recounts; the other cron is the daily job */
+const EVERY_MINUTE = "* * * * *";
 const HOUR = 3_600_000;
 const MAX_BODY = 256 * 1024;
 const MAX_SEED = 1024 * 1024;
@@ -118,8 +122,6 @@ interface Ctx {
   url: URL;
   now: number;
   t: Thresholds;
-  /** the start of the recent window, ISO */
-  since: string;
   body: Uint8Array<ArrayBuffer>;
 }
 
@@ -202,20 +204,28 @@ async function newKeyLimit(c: Ctx, key: string) {
     throw tooMany(`a key new this hour uploads at most ${c.t.newKeyUploads} versions`, seen + HOUR, c.now);
 }
 
+const recompute = (c: Ctx, v: VersionRow) => judge(c.env.DB, c.t, c.now, v);
+
 /**
  * Applies what the version's reports now say to its status, and keeps their counts beside it. Counting
  * reads every report of the version, so one that many installs report is recounted at most every
- * `statsSeconds`: otherwise each report would cost as many reads as the version has installs.
+ * `statsSeconds`, otherwise each report would cost as many reads as the version has installs. A report
+ * in between marks it pending, and the job every minute recounts it (`force`), so no status change
+ * waits on another report coming.
  */
-async function recompute(c: Ctx, v: VersionRow): Promise<Status> {
+async function judge(db: D1Database, t: Thresholds, at: number, v: VersionRow, force = false): Promise<Status> {
   const counted = v.stats_at ? Date.parse(v.stats_at) : 0;
-  if (v.reporters >= c.t.statsLiveUpTo && c.now - counted < c.t.statsSeconds * 1000) return v.status;
-  const weekAgo = new Date(c.now - 7 * DAY).toISOString();
-  const now = new Date(c.now).toISOString();
-  const f = await facts(c.env.DB, v, c.since, c.t.degradeWindow, weekAgo);
-  await putStats(c.env.DB, v.hash, f.stats, now);
-  const status = nextStatus(v.status, f, c.t);
-  if (status !== v.status) await setStatus(c.env.DB, v.hash, status, now);
+  if (!force && v.reporters >= t.statsLiveUpTo && at - counted < t.statsSeconds * 1000) {
+    await markPending(db, v.hash);
+    return v.status;
+  }
+  const since = new Date(at - t.recentDays * DAY).toISOString();
+  const weekAgo = new Date(at - 7 * DAY).toISOString();
+  const now = new Date(at).toISOString();
+  const f = await facts(db, v, since, t.degradeWindow, weekAgo);
+  await putStats(db, v.hash, f.stats, now);
+  const status = nextStatus(v.status, f, t);
+  if (status !== v.status) await setStatus(db, v.hash, status, now);
   return status;
 }
 
@@ -643,8 +653,7 @@ async function route(request: Request, env: Env, now: number): Promise<Response>
   if (hit.auth === "admin") await admin(request, env);
   const t = thresholds(env);
   const body = await readBody(request, hit.max ?? MAX_BODY);
-  const since = new Date(now - t.recentDays * DAY).toISOString();
-  return hit.handler({ request, env, url, now, t, since, body }, hit.param);
+  return hit.handler({ request, env, url, now, t, body }, hit.param);
 }
 
 /** The Workers Cache API's default cache, absent outside Workers (tests may stand one in). */
@@ -692,12 +701,18 @@ export default {
   },
 
   /**
-   * The daily job: archive stale candidates and degraded versions, and degraded versions a newer live one
-   * replaced; delete what was archived over 30 days ago, with its reports.
+   * Every minute: recount the versions whose recount a report found held back. Daily: archive stale
+   * candidates and degraded versions, and degraded versions a newer live one replaced; delete what was
+   * archived over 30 days ago, with its reports; recount every version as reports age out.
    */
-  async scheduled(controller: { scheduledTime: number }, env: Env): Promise<void> {
+  async scheduled(controller: { scheduledTime: number; cron?: string }, env: Env): Promise<void> {
     const now = controller.scheduledTime;
-    const cutoff = new Date(now - thresholds(env).recentDays * DAY).toISOString();
+    const t = thresholds(env);
+    if (controller.cron === EVERY_MINUTE) {
+      for (const v of await pendingVersions(env.DB)) await judge(env.DB, t, now, v, true);
+      return;
+    }
+    const cutoff = new Date(now - t.recentDays * DAY).toISOString();
     const gone = toArchive(await archiveCandidates(env.DB), cutoff);
     await archive(
       env.DB,

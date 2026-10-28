@@ -455,6 +455,23 @@ describe("maintenance by the crowd", () => {
     assert.equal(await confirmations(), 5, "the daily job recounts every version");
   });
 
+  test("a status change held back on a popular version waits for the minute job, not for another report", async () => {
+    const { env, raw } = registry({ STATS_LIVE_UP_TO: "1" });
+    const live = (await seed(env, { site, operations: [op()] })).body.operations[0];
+    const status = () =>
+      raw.prepare("SELECT status, pending FROM versions WHERE hash = ?").get(live.hash) as {
+        status: string;
+        pending: number;
+      };
+
+    await report(env, install(), live.hash, "ok", NET1);
+    for (const ip of ["100.64.1.1", "100.64.2.1", "100.64.3.1"]) await report(env, install(), live.hash, "fail", ip);
+    assert.deepEqual({ ...status() }, { status: "live", pending: 1 }, "three failures, held back and marked");
+
+    await worker.scheduled({ scheduledTime: Date.now(), cron: "* * * * *" }, env);
+    assert.deepEqual({ ...status() }, { status: "degraded", pending: 0 });
+  });
+
   test("a review version is served only to its uploader", async () => {
     const { env } = registry();
     const uploader = install();
